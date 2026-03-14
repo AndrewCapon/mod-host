@@ -4578,9 +4578,12 @@ int effects_init(void* client)
     //   ENABLE_MIDI_FEEDBACK = 1 : Enable midi CC feedback
     //   ENABLE_MIDI_FEEDBACK = 2 : Enable midi CC feedback and also sync devices on input 
 
-    const char* const enable_midi_feedback = getenv("ENABLE_MIDI_FEEDBACK");
-    g_enable_midi_feedback      = enable_midi_feedback != NULL && atoi(enable_midi_feedback) != 0;
-    g_enable_midi_feedback_sync = enable_midi_feedback != NULL && atoi(enable_midi_feedback) == 2;
+    // const char* const enable_midi_feedback = getenv("ENABLE_MIDI_FEEDBACK");
+    // g_enable_midi_feedback      = enable_midi_feedback != NULL && atoi(enable_midi_feedback) != 0;
+    // g_enable_midi_feedback_sync = enable_midi_feedback != NULL && atoi(enable_midi_feedback) == 2;
+
+    g_enable_midi_feedback      = true;
+    g_enable_midi_feedback_sync = true;
 
     // setup nrpn
     //   ENABLE_MIDI_NRPN = 1 : Enable midi nrpn
