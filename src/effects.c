@@ -30,12 +30,38 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <dlfcn.h>
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
 #include <pthread.h>
 #include <sys/stat.h>
+
+#ifdef _WIN32
+#include <direct.h>
+#include <io.h>
+#include <winsock2.h>
+#include <windows.h>
+typedef unsigned int uint;
+#define PRIi64 "lld"
+#define PRId64 "llu"
+#define RTLD_LOCAL 0
+#define RTLD_NOW 0
+#define dlopen(path, flags)  LoadLibrary(path)
+#define dlsym(lib, funcname) GetProcAddress((HMODULE)lib, funcname)
+#define dlclose(lib)         FreeLibrary((HMODULE)lib)
+#define setenv(...)
+#define unsetenv(...)
+#else
+#include <dlfcn.h>
+#endif
+
+#if defined(_DARKGLASS_DEVICE_PABLITO)
+#include <sys/resource.h>
+#elif defined(_MOD_DEVICE_DUO) || defined(_MOD_DEVICE_DUOX) || defined(_MOD_DEVICE_DWARF)
+#include <sys/resource.h>
+#include <syscall.h>
+#include <unistd.h>
+#endif
 
 /* Jack */
 #include <jack/jack.h>
@@ -48,26 +74,39 @@
 
 /* LV2 and Lilv */
 #include <lilv/lilv.h>
-#include <lv2/lv2plug.in/ns/ext/atom/atom.h>
-#include <lv2/lv2plug.in/ns/ext/atom/forge.h>
-#include <lv2/lv2plug.in/ns/ext/buf-size/buf-size.h>
-#include <lv2/lv2plug.in/ns/ext/event/event.h>
-#include <lv2/lv2plug.in/ns/ext/log/log.h>
-#include <lv2/lv2plug.in/ns/ext/midi/midi.h>
-#include <lv2/lv2plug.in/ns/ext/options/options.h>
-#include <lv2/lv2plug.in/ns/ext/patch/patch.h>
-#include <lv2/lv2plug.in/ns/ext/parameters/parameters.h>
-#include <lv2/lv2plug.in/ns/ext/port-props/port-props.h>
-#include <lv2/lv2plug.in/ns/ext/presets/presets.h>
-#include <lv2/lv2plug.in/ns/ext/resize-port/resize-port.h>
-#include <lv2/lv2plug.in/ns/ext/state/state.h>
-#include <lv2/lv2plug.in/ns/ext/time/time.h>
-#include <lv2/lv2plug.in/ns/ext/urid/urid.h>
-#include <lv2/lv2plug.in/ns/ext/uri-map/uri-map.h>
-#include <lv2/lv2plug.in/ns/ext/worker/worker.h>
+#include <lv2/atom/atom.h>
+#include <lv2/atom/forge.h>
+#include <lv2/buf-size/buf-size.h>
+#include <lv2/event/event.h>
+#include <lv2/log/log.h>
+#include <lv2/midi/midi.h>
+#include <lv2/options/options.h>
+#include <lv2/patch/patch.h>
+#include <lv2/parameters/parameters.h>
+#include <lv2/port-props/port-props.h>
+#include <lv2/presets/presets.h>
+#include <lv2/resize-port/resize-port.h>
+#include <lv2/state/state.h>
+#include <lv2/time/time.h>
+#include <lv2/urid/urid.h>
+#include <lv2/uri-map/uri-map.h>
+#include <lv2/worker/worker.h>
 #include "lv2/control-input-port-change-request.h"
+#include "lv2/control-port-state-update.h"
+#include "lv2/kxstudio-properties.h"
 #include "lv2/lv2-hmi.h"
 #include "lv2/mod-license.h"
+
+// do not enable external-ui support in embed targets
+#if !(defined(_DARKGLASS_DEVICE_PABLITO) || defined(_MOD_DEVICE_DUO) || defined(_MOD_DEVICE_DUOX) || defined(_MOD_DEVICE_DWARF))
+#define WITH_EXTERNAL_UI_SUPPORT
+#endif
+
+#ifdef WITH_EXTERNAL_UI_SUPPORT
+#include <lv2/data-access/data-access.h>
+#include <lv2/instance-access/instance-access.h>
+#include <lv2/ui/ui.h>
+#endif
 
 #ifdef HAVE_CONTROLCHAIN
 /* Control Chain */
@@ -80,10 +119,6 @@
 #endif
 
 #include "mod-host.h"
-#ifdef __MOD_DEVICES__
-#include "sys_host.h"
-#include "dsp/gate_core.h"
-#endif
 
 #ifndef HAVE_NEW_LILV
 #define lilv_free(x) free(x)
@@ -118,14 +153,17 @@ typedef struct {
 
 #define LILV_NS_MOD "http://moddevices.com/ns/mod#"
 
-#define KX_TIME__TicksPerBeat "http://kxstudio.sf.net/ns/lv2ext/props#TimePositionTicksPerBeat"
-
 // custom jack flag used for cv
 // needed because we prefer jack2 which doesn't have metadata yet
 #define JackPortIsControlVoltage 0x100
 
 #if defined(_MOD_DEVICE_DUOX) || defined(_MOD_DEVICE_DWARF)
+#define MOD_HMI_CONTROL_ENABLED
 #define MOD_IO_PROCESSING_ENABLED
+#endif
+
+#ifdef _DARKGLASS_DEVICE_PABLITO
+#define _DARKGLASS_PABLITO
 #endif
 
 /* Local */
@@ -142,6 +180,15 @@ typedef struct {
 #include "rtmempool/list.h"
 #include "rtmempool/rtmempool.h"
 #include "filter.h"
+#include "mod-memset.h"
+
+#ifdef MOD_HMI_CONTROL_ENABLED
+#include "sys_host.h"
+#endif
+
+#ifdef __MOD_DEVICES__
+#include "dsp/gate_core.h"
+#endif
 
 /*
 ************************************************************************************************************************
@@ -190,19 +237,22 @@ enum PortType {
 
 enum PortHints {
     // controls
-    HINT_ENUMERATION   = 1 << 0,
-    HINT_INTEGER       = 1 << 1,
-    HINT_TOGGLE        = 1 << 2,
-    HINT_TRIGGER       = 1 << 3,
-    HINT_LOGARITHMIC   = 1 << 4,
-    HINT_MONITORED     = 1 << 5, // outputs only
+    HINT_ENUMERATION    = 1 << 0,
+    HINT_INTEGER        = 1 << 1,
+    HINT_TOGGLE         = 1 << 2,
+    HINT_TRIGGER        = 1 << 3,
+    HINT_LOGARITHMIC    = 1 << 4,
+    HINT_MONITORED      = 1 << 5, // outputs only
+    HINT_SHOULD_UPDATE  = 1 << 6, // inputs only, for external UIs
+    HINT_STATE_INACTIVE = 1 << 7,
+    HINT_STATE_BLOCKED  = 1 << 8,
     // cv
-    HINT_CV_MOD        = 1 << 0, // uses mod cvport
-    HINT_CV_RANGES     = 1 << 0, // port info includes ranges
+    HINT_CV_MOD         = 1 << 0, // uses mod cvport
+    HINT_CV_RANGES      = 1 << 1, // port info includes ranges
     // events
-    HINT_TRANSPORT     = 1 << 0,
-    HINT_MIDI_EVENT    = 1 << 1,
-    HINT_OLD_EVENT_API = 1 << 2,
+    HINT_TRANSPORT      = 1 << 0,
+    HINT_MIDI_EVENT     = 1 << 1,
+    HINT_OLD_EVENT_API  = 1 << 2,
 };
 
 enum PluginHints {
@@ -212,6 +262,7 @@ enum PluginHints {
     HINT_HAS_MIDI_INPUT  = 1 << 3,
     HINT_HAS_STATE       = 1 << 4,
     HINT_STATE_UNSAFE    = 1 << 5, // state restore needs mutex protection
+    HINT_IS_LIVE         = 1 << 6, // needs to be always running, cannot have processing disabled
 };
 
 enum TransportSyncMode {
@@ -225,7 +276,7 @@ enum {
     URID_MAP_FEATURE,
     URID_UNMAP_FEATURE,
     OPTIONS_FEATURE,
-#ifdef __MOD_DEVICES__
+#ifdef MOD_HMI_CONTROL_ENABLED
     HMI_WC_FEATURE,
 #endif
     LICENSE_FEATURE,
@@ -236,13 +287,21 @@ enum {
     STATE_FREE_PATH_FEATURE,
     STATE_MAKE_PATH_FEATURE,
     CTRLPORT_REQUEST_FEATURE,
+    CTRLPORT_STATE_FEATURE,
     WORKER_FEATURE,
+#ifdef WITH_EXTERNAL_UI_SUPPORT
+    UI_DATA_ACCESS,
+    UI_INSTANCE_ACCESS,
+#endif
     FEATURE_TERMINATOR
 };
 
 enum PostPonedEventType {
     POSTPONED_PARAM_SET,
+    POSTPONED_PARAM_STATE,
+    POSTPONED_AUDIO_MONITOR,
     POSTPONED_OUTPUT_MONITOR,
+    POSTPONED_MIDI_CONTROL_CHANGE,
     POSTPONED_MIDI_PROGRAM_CHANGE,
     POSTPONED_MIDI_MAP,
     POSTPONED_TRANSPORT,
@@ -266,10 +325,16 @@ enum UpdatePositionFlag {
 ************************************************************************************************************************
 */
 
-#ifdef __MOD_DEVICES__
+#ifdef MOD_HMI_CONTROL_ENABLED
 typedef struct HMI_ADDRESSING_T hmi_addressing_t;
 #endif
 typedef struct PORT_T port_t;
+
+typedef struct AUDIO_MONITOR_T {
+    jack_port_t *port;
+    char *source_port_name;
+    float value;
+} audio_monitor_t;
 
 typedef struct CV_SOURCE_T {
     port_t *port;
@@ -300,7 +365,7 @@ typedef struct PORT_T {
     LilvScalePoints* scale_points;
     cv_source_t* cv_source;
     pthread_mutex_t cv_source_mutex;
-#ifdef __MOD_DEVICES__
+#ifdef MOD_HMI_CONTROL_ENABLED
     hmi_addressing_t* hmi_addressing;
 #endif
 } port_t;
@@ -372,6 +437,7 @@ typedef struct EFFECT_T {
     int32_t control_index; // control/event input
     int32_t enabled_index;
     int32_t freewheel_index;
+    int32_t reset_index;
     int32_t bpb_index;
     int32_t bpm_index;
     int32_t speed_index;
@@ -393,6 +459,8 @@ typedef struct EFFECT_T {
     jack_ringbuffer_t *events_in_buffer;
     jack_ringbuffer_t *events_out_buffer;
     char *events_in_buffer_helper;
+
+    bool activated;
 
     // previous transport state
     bool transport_rolling;
@@ -417,6 +485,14 @@ typedef struct EFFECT_T {
 
     // state save/restore custom directory
     const char* state_dir;
+
+#ifdef WITH_EXTERNAL_UI_SUPPORT
+    // UI related objects
+    void *ui_libhandle;
+    LV2UI_Handle *ui_handle;
+    const LV2UI_Descriptor *ui_desc;
+    const LV2UI_Idle_Interface *ui_idle_iface;
+#endif
 } effect_t;
 
 typedef struct LILV_NODES_T {
@@ -433,6 +509,7 @@ typedef struct LILV_NODES_T {
     LilvNode *hmi_interface;
     LilvNode *input;
     LilvNode *integer;
+    LilvNode *is_live;
     LilvNode *license_interface;
     LilvNode *logarithmic;
     LilvNode *maximum;
@@ -453,6 +530,7 @@ typedef struct LILV_NODES_T {
     LilvNode *preset;
     LilvNode *rawMIDIClockAccess;
     LilvNode *rdfs_range;
+    LilvNode *reset;
     LilvNode *sample_rate;
     LilvNode *state_interface;
     LilvNode *state_load_default_state;
@@ -483,6 +561,7 @@ typedef struct URIDS_T {
     LV2_URID bufsz_minBlockLength;
     LV2_URID bufsz_nomimalBlockLength;
     LV2_URID bufsz_sequenceSize;
+    LV2_URID jack_client;
     LV2_URID log_Error;
     LV2_URID log_Note;
     LV2_URID log_Trace;
@@ -530,17 +609,41 @@ typedef struct ASSIGNMENT_T {
     bool supports_set_value;
 } assignment_t;
 
+#ifdef MOD_HMI_CONTROL_ENABLED
 typedef struct HMI_ADDRESSING_T {
     int actuator_id;
     uint8_t page;
     uint8_t subpage;
 } hmi_addressing_t;
+#endif
+
+typedef struct SYNC_SCHEDULED_PARAM_T {
+    port_t *port;
+    float value;
+} sync_scheduled_param_t;
 
 typedef struct POSTPONED_PARAMETER_EVENT_T {
     int effect_id;
     const char* symbol;
     float value;
 } postponed_parameter_event_t;
+
+typedef struct POSTPONED_PARAMETER_STATE_T {
+    int effect_id;
+    const char* symbol;
+    int state;
+} postponed_parameter_state_t;
+
+typedef struct POSTPONED_AUDIO_MONITOR_EVENT_T {
+    int index;
+    float value;
+} postponed_audio_monitor_event_t;
+
+typedef struct POSTPONED_MIDI_CONTROL_CHANGE_EVENT_T {
+    int8_t channel;
+    int8_t control;
+    int16_t value;
+} postponed_midi_control_change_event_t;
 
 typedef struct POSTPONED_MIDI_PROGRAM_CHANGE_EVENT_T {
     int8_t program;
@@ -584,6 +687,9 @@ typedef struct POSTPONED_EVENT_T {
     enum PostPonedEventType type;
     union {
         postponed_parameter_event_t parameter;
+        postponed_parameter_state_t state;
+        postponed_audio_monitor_event_t audio_monitor;
+        postponed_midi_control_change_event_t control_change;
         postponed_midi_program_change_event_t program_change;
         postponed_midi_map_event_t midi_map;
         postponed_transport_event_t transport;
@@ -627,6 +733,12 @@ typedef struct RAW_MIDI_PORT_ITEM {
     struct list_head siblings;
 } raw_midi_port_item;
 
+typedef struct CACHED_EFFECT_FLUSH_T {
+    effect_t *effect;
+    port_t **ports;
+    int num_ports;
+} cached_effect_flush_t;
+
 
 /*
 ************************************************************************************************************************
@@ -662,7 +774,7 @@ static pthread_mutex_t  g_rtsafe_mutex;
 static volatile int  g_postevents_running; // 0: stopped, 1: running, -1: stopped & about to close mod-host
 static volatile bool g_postevents_ready;
 static sem_t         g_postevents_semaphore;
-static pthread_t     g_postevents_thread;
+static ZixThread     g_postevents_thread;
 
 /* raw-midi-clock-access ports */
 static struct list_head g_raw_midi_port_list;
@@ -671,6 +783,7 @@ static pthread_mutex_t  g_raw_midi_port_mutex;
 /* Jack */
 static jack_client_t *g_jack_global_client;
 static jack_nframes_t g_sample_rate, g_max_allowed_midi_delta;
+static float g_sample_rate_f;
 static const char **g_capture_ports, **g_playback_ports;
 static int32_t g_midi_buffer_size, g_block_length;
 static int32_t g_thread_policy, g_thread_priority;
@@ -680,10 +793,14 @@ static jack_port_t *g_audio_in2_port;
 static jack_port_t *g_audio_out1_port;
 static jack_port_t *g_audio_out2_port;
 #endif
+static audio_monitor_t *g_audio_monitors;
+static pthread_mutex_t g_audio_monitor_mutex;
+static int g_audio_monitor_count;
 static jack_port_t *g_midi_in_port;
 static jack_port_t *g_midi_out_port;
 static jack_position_t g_jack_pos;
 static bool g_jack_rolling;
+static uint32_t g_jack_xruns;
 static volatile double g_transport_bpb;
 static volatile double g_transport_bpm;
 static volatile bool g_transport_reset;
@@ -697,6 +814,8 @@ static bool g_enable_nrpn;
 
 static uint16_t  g_nrpn_param_num;
 static uint16_t  g_nrpn_param_value;
+static bool g_cpu_load_enabled;
+static volatile bool g_cpu_load_trigger;
 
 // Wall clock time since program startup
 static uint64_t g_monotonic_frame_count = 0;
@@ -713,24 +832,37 @@ static char *g_lv2_scratch_dir;
 static Symap* g_symap;
 static lilv_nodes_t g_lilv_nodes;
 static urids_t g_urids;
-#ifdef __MOD_DEVICES__
+#ifdef MOD_HMI_CONTROL_ENABLED
 static LV2_HMI_WidgetControl g_hmi_wc;
 #endif
 static MOD_License_Feature g_license;
 static LV2_Atom_Forge g_lv2_atom_forge;
 static LV2_Log_Log g_lv2_log;
-static LV2_Options_Option g_options[8];
+static LV2_Options_Option g_options[9];
 static LV2_State_Free_Path g_state_freePath;
-static LV2_URI_Map_Feature g_uri_map;
 static LV2_URID_Map g_urid_map;
 static LV2_URID_Unmap g_urid_unmap;
+
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__GNUC__) && (__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 6))
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+static LV2_URI_Map_Feature g_uri_map;
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__) && (__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 6))
+#pragma GCC diagnostic pop
+#endif
 
 static LV2_Feature g_buf_size_features[3] = {
     { LV2_BUF_SIZE__powerOf2BlockLength, NULL },
     { LV2_BUF_SIZE__fixedBlockLength, NULL },
     { LV2_BUF_SIZE__boundedBlockLength, NULL }
 };
-#ifdef __MOD_DEVICES__
+#ifdef MOD_HMI_CONTROL_ENABLED
 static LV2_Feature g_hmi_wc_feature = { LV2_HMI__WidgetControl, &g_hmi_wc };
 #endif
 static LV2_Feature g_license_feature = { MOD_LICENSE__feature, &g_license };
@@ -744,31 +876,39 @@ static LV2_Feature g_urid_unmap_feature = { LV2_URID__unmap, &g_urid_unmap };
 /* MIDI Learn */
 static pthread_mutex_t g_midi_learning_mutex;
 
-/* MIDI program monitoring */
+/* MIDI control and program monitoring */
+static bool g_monitored_midi_controls[16];
 static bool g_monitored_midi_programs[16];
+
+/* Postponed port updates */
+static sync_scheduled_param_t g_sync_scheduled_params[MAX_SYNC_SCHEDULED_PARAMS];
+static pthread_mutex_t g_sync_scheduled_params_mutex;
+static unsigned int g_sync_scheduled_param_count;
 
 #ifdef HAVE_HYLIA
 static hylia_t* g_hylia_instance;
 static hylia_time_info_t g_hylia_timeinfo;
 #endif
 
-#ifdef __MOD_DEVICES__
+#ifdef MOD_HMI_CONTROL_ENABLED
 /* HMI integration */
 static int g_hmi_shmfd;
 static sys_serial_shm_data* g_hmi_data;
-static pthread_t g_hmi_client_thread;
+static ZixThread g_hmi_client_thread;
 static pthread_mutex_t g_hmi_mutex;
 static hmi_addressing_t g_hmi_addressings[MAX_HMI_ADDRESSINGS];
+#endif
 
 /* internal processing */
+#ifdef MOD_HMI_CONTROL_ENABLED
 static int g_compressor_mode = 0;
 static int g_compressor_release = 100;
+#endif
 #ifdef MOD_IO_PROCESSING_ENABLED
 static int g_noisegate_channel = 0;
 static int g_noisegate_decay = 10;
 static int g_noisegate_threshold = -60;
 static gate_t g_noisegate;
-#endif
 #endif
 
 static const char* const g_bypass_port_symbol = BYPASS_PORT_SYMBOL;
@@ -789,13 +929,14 @@ static void AllocatePortBuffers(effect_t* effect, int in_size, int out_size);
 static int BufferSize(jack_nframes_t nframes, void* data);
 static void FreeWheelMode(int starting, void* data);
 static void PortRegistration(jack_port_id_t port_id, int reg, void* data);
+static int XRun(void* data);
 static void RunPostPonedEvents(int ignored_effect_id);
 static void* PostPonedEventsThread(void* arg);
-#ifdef __MOD_DEVICES__
+#ifdef MOD_HMI_CONTROL_ENABLED
 static void* HMIClientThread(void* arg);
 #endif
 static int ProcessPlugin(jack_nframes_t nframes, void *arg);
-static bool SetPortValue(port_t *port, float value, int effect_id, bool is_bypass);
+static bool SetPortValue(port_t *port, float value, int effect_id, bool is_bypass, bool from_ui);
 static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres);
 static bool UpdateGlobalJackPosition(enum UpdatePositionFlag flag, bool do_post);
 static int ProcessGlobalClient(jack_nframes_t nframes, void *arg);
@@ -809,12 +950,12 @@ static property_t *FindEffectPropertyByURI(effect_t *effect, const char *uri);
 static port_t *FindEffectInputPortBySymbol(effect_t *effect, const char *control_symbol);
 static port_t *FindEffectOutputPortBySymbol(effect_t *effect, const char *control_symbol);
 static const void *GetPortValueForState(const char* symbol, void* user_data, uint32_t* size, uint32_t* type);
-static int LoadPresets(effect_t *effect);
+static void LoadPresets(effect_t *effect);
 static void FreeFeatures(effect_t *effect);
 static void FreePluginString(void* handle, char *str);
 static void ConnectToAllHardwareMIDIPorts(void);
 static void ConnectToMIDIThroughPorts(void);
-#ifdef __MOD_DEVICES__
+#ifdef MOD_HMI_CONTROL_ENABLED
 static void HMIWidgetsSetLedWithBlink(LV2_HMI_WidgetControl_Handle handle,
                                       LV2_HMI_Addressing addressing,
                                       LV2_HMI_LED_Colour led_color,
@@ -846,7 +987,11 @@ static char *GetLicenseFile(MOD_License_Handle handle, const char *license_uri);
 static int LogPrintf(LV2_Log_Handle handle, LV2_URID type, const char *fmt, ...);
 static int LogVPrintf(LV2_Log_Handle handle, LV2_URID type, const char *fmt, va_list ap);
 static LV2_ControlInputPort_Change_Status RequestControlPortChange(LV2_ControlInputPort_Change_Request_Handle handle,
-                                                                   uint32_t index, float value);
+                                                                   uint32_t index,
+                                                                   float value);
+static LV2_Control_Port_State_Update_Status UpdateControlPortState(LV2_Control_Port_State_Update_Handle handle,
+                                                                   uint32_t index,
+                                                                   LV2_Control_Port_State state);
 static char* MakePluginStatePathFromSratchDir(LV2_State_Make_Path_Handle handle, const char *path);
 static char* MakePluginStatePathDuringLoadSave(LV2_State_Make_Path_Handle handle, const char *path);
 #ifdef HAVE_CONTROLCHAIN
@@ -857,6 +1002,16 @@ static bool CheckCCDeviceProtocolVersion(int device_id, int major, int minor);
 #ifdef HAVE_HYLIA
 static uint32_t GetHyliaOutputLatency(void);
 #endif
+#ifdef WITH_EXTERNAL_UI_SUPPORT
+static void ExternalControllerWriteFunction(LV2UI_Controller controller,
+                                            uint32_t port_index,
+                                            uint32_t buffer_size,
+                                            uint32_t port_protocol,
+                                            const void *buffer);
+#endif
+
+static void* effects_activate_thread(void* arg);
+static void* effects_deactivate_thread(void* arg);
 
 /*
 ************************************************************************************************************************
@@ -872,9 +1027,9 @@ static uint32_t GetHyliaOutputLatency(void);
 */
 
 
-#ifdef __APPLE__
-// FIXME missing on macOS
-static char* strchrnul(const char *s, int c)
+#if defined(__APPLE__) || defined(_WIN32)
+// FIXME missing on macOS and Windows
+static char* _strchrnul(const char *s, int c)
 {
     char *r = strchr(s, c);
 
@@ -883,6 +1038,30 @@ static char* strchrnul(const char *s, int c)
 
     return r;
 }
+#define strchrnul _strchrnul
+#endif
+
+#ifdef _WIN32
+// missing on Windows
+static char* _realpath(const char *name, char *resolved)
+{
+    if (name == NULL)
+        return NULL;
+
+    if (_access(name, 4) != 0)
+        return NULL;
+
+    char *retname = NULL;
+
+    if ((retname = resolved) == NULL)
+        retname = malloc(PATH_MAX + 2);
+
+    if (retname == NULL)
+        return NULL;
+
+    return _fullpath(retname, name, PATH_MAX);
+}
+#define realpath _realpath
 #endif
 
 #ifdef ENABLE_TMP_LOG
@@ -924,7 +1103,7 @@ static void SetMidiOutValue(midi_cc_t *midiCC)
 static void InstanceDelete(int effect_id)
 {
     if (INSTANCE_IS_VALID(effect_id))
-        bzero(&g_effects[effect_id], sizeof(effect_t));
+        memset(&g_effects[effect_id], 0, sizeof(effect_t));
 }
 
 static int InstanceExist(int effect_id)
@@ -1012,7 +1191,13 @@ static int BufferSize(jack_nframes_t nframes, void* data)
             options[4].type = 0;
             options[4].value = NULL;
 
+            if (effect->activated)
+                lilv_instance_deactivate(effect->lilv_instance);
+
             effect->options_interface->set(effect->lilv_instance->lv2_handle, options);
+
+            if (effect->activated)
+                lilv_instance_activate(effect->lilv_instance);
         }
     }
 #ifdef HAVE_HYLIA
@@ -1079,6 +1264,15 @@ static void PortRegistration(jack_port_id_t port_id, int reg, void* data)
     UNUSED_PARAM(data);
 }
 
+static int XRun(void *data)
+{
+    ++g_jack_xruns;
+
+    return 0;
+
+    UNUSED_PARAM(data);
+}
+
 static bool ShouldIgnorePostPonedEffectEvent(int effect_id, postponed_cached_effect_events* cached_events)
 {
     if (effect_id == cached_events->last_effect_id)
@@ -1114,15 +1308,16 @@ static bool ShouldIgnorePostPonedEffectEvent(int effect_id, postponed_cached_eff
     return false;
 }
 
-static bool ShouldIgnorePostPonedSymbolEvent(postponed_parameter_event_t* ev,
+static bool ShouldIgnorePostPonedSymbolEvent(int effect_id,
+                                             const char* symbol,
                                              postponed_cached_symbol_events* cached_events)
 {
     // symbol must not be null
-    if (ev->symbol == NULL)
+    if (symbol == NULL)
         return false;
 
-    if (ev->effect_id == cached_events->last_effect_id &&
-        strncmp(ev->symbol, cached_events->last_symbol, MAX_CHAR_BUF_SIZE) == 0)
+    if (effect_id == cached_events->last_effect_id &&
+        strncmp(symbol, cached_events->last_symbol, MAX_CHAR_BUF_SIZE) == 0)
     {
         // already received this event, like just now
         return true;
@@ -1135,8 +1330,8 @@ static bool ShouldIgnorePostPonedSymbolEvent(postponed_parameter_event_t* ev,
     {
         postponed_cached_symbol_list_data* const psymbol = list_entry(it, postponed_cached_symbol_list_data, siblings);
 
-        if (ev->effect_id == psymbol->effect_id &&
-            strncmp(ev->symbol, psymbol->symbol, MAX_CHAR_BUF_SIZE) == 0)
+        if (effect_id == psymbol->effect_id &&
+            strncmp(symbol, psymbol->symbol, MAX_CHAR_BUF_SIZE) == 0)
         {
             // haha! found you little bastard!
             return true;
@@ -1149,8 +1344,8 @@ static bool ShouldIgnorePostPonedSymbolEvent(postponed_parameter_event_t* ev,
 
     if (psymbol)
     {
-        psymbol->effect_id = ev->effect_id;
-        strncpy(psymbol->symbol, ev->symbol, MAX_CHAR_BUF_SIZE);
+        psymbol->effect_id = effect_id;
+        strncpy(psymbol->symbol, symbol, MAX_CHAR_BUF_SIZE);
         psymbol->symbol[MAX_CHAR_BUF_SIZE] = '\0';
         list_add_tail(&psymbol->siblings, &cached_events->symbols.siblings);
     }
@@ -1183,7 +1378,14 @@ static void RunPostPonedEvents(int ignored_effect_id)
     list_splice_init(&g_rtsafe_list, &queue);
     pthread_mutex_unlock(&g_rtsafe_mutex);
 
-    if (list_empty(&queue))
+    // fetch this value only once per run
+    const bool cpu_load_trigger = g_jack_global_client != NULL && g_cpu_load_trigger;
+
+    if (cpu_load_trigger)
+    {
+        g_cpu_load_trigger = false;
+    }
+    else if (list_empty(&queue))
     {
         // nothing to do
         if (g_verbose_debug) {
@@ -1201,22 +1403,28 @@ static void RunPostPonedEvents(int ignored_effect_id)
     // cached data, to make sure we only handle similar events once
     bool got_midi_program = false;
     bool got_transport = false;
-    postponed_cached_effect_events cached_process_out_buf;
-    postponed_cached_symbol_events cached_param_set, cached_output_mon;
+    postponed_cached_effect_events cached_audio_monitor, cached_process_out_buf;
+    postponed_cached_symbol_events cached_param_set, cached_param_state, cached_output_mon;
 
+    cached_audio_monitor.last_effect_id = -1;
     cached_process_out_buf.last_effect_id = -1;
     cached_param_set.last_effect_id = -1;
-    cached_output_mon.last_effect_id = -1;
     cached_param_set.last_symbol[0] = '\0';
     cached_param_set.last_symbol[MAX_CHAR_BUF_SIZE] = '\0';
+    cached_param_state.last_effect_id = -1;
+    cached_param_state.last_symbol[0] = '\0';
+    cached_param_state.last_symbol[MAX_CHAR_BUF_SIZE] = '\0';
+    cached_output_mon.last_effect_id = -1;
     cached_output_mon.last_symbol[0] = '\0';
     cached_output_mon.last_symbol[MAX_CHAR_BUF_SIZE] = '\0';
+    INIT_LIST_HEAD(&cached_audio_monitor.effects.siblings);
     INIT_LIST_HEAD(&cached_process_out_buf.effects.siblings);
     INIT_LIST_HEAD(&cached_param_set.symbols.siblings);
+    INIT_LIST_HEAD(&cached_param_state.symbols.siblings);
     INIT_LIST_HEAD(&cached_output_mon.symbols.siblings);
 
     // if all we have are jack_midi_connect requests, do not send feedback to server
-    bool got_only_jack_midi_requests = true;
+    bool got_only_jack_midi_requests = !cpu_load_trigger;
 
     if (g_verbose_debug) {
         puts("DEBUG: RunPostPonedEvents() Before the queue iteration");
@@ -1246,7 +1454,9 @@ static void RunPostPonedEvents(int ignored_effect_id)
         case POSTPONED_PARAM_SET:
             if (eventptr->event.parameter.effect_id == ignored_effect_id)
                 continue;
-            if (ShouldIgnorePostPonedSymbolEvent(&eventptr->event.parameter, &cached_param_set))
+            if (ShouldIgnorePostPonedSymbolEvent(eventptr->event.parameter.effect_id,
+                                                 eventptr->event.parameter.symbol,
+                                                 &cached_param_set))
                 continue;
 
             snprintf(buf, FEEDBACK_BUF_SIZE, "param_set %i %s %f", eventptr->event.parameter.effect_id,
@@ -1259,10 +1469,47 @@ static void RunPostPonedEvents(int ignored_effect_id)
             strncpy(cached_param_set.last_symbol, eventptr->event.parameter.symbol, MAX_CHAR_BUF_SIZE);
             break;
 
+        case POSTPONED_PARAM_STATE:
+            if (eventptr->event.state.effect_id == ignored_effect_id)
+                continue;
+            if (ShouldIgnorePostPonedSymbolEvent(eventptr->event.state.effect_id,
+                                                 eventptr->event.state.symbol,
+                                                 &cached_param_state))
+                continue;
+
+            snprintf(buf, FEEDBACK_BUF_SIZE, "param_state %i %s %i", eventptr->event.state.effect_id,
+                                                                     eventptr->event.state.symbol,
+                                                                     eventptr->event.state.state);
+            socket_send_feedback_debug(buf);
+
+            // save for fast checkup next time
+            cached_param_state.last_effect_id = eventptr->event.state.effect_id;
+            strncpy(cached_param_state.last_symbol, eventptr->event.state.symbol, MAX_CHAR_BUF_SIZE);
+            break;
+
+        case POSTPONED_AUDIO_MONITOR:
+            if (ShouldIgnorePostPonedEffectEvent(eventptr->event.audio_monitor.index, &cached_audio_monitor))
+                continue;
+
+            pthread_mutex_lock(&g_audio_monitor_mutex);
+            if (eventptr->event.audio_monitor.index < g_audio_monitor_count)
+                g_audio_monitors[eventptr->event.audio_monitor.index].value = 0.f;
+            pthread_mutex_unlock(&g_audio_monitor_mutex);
+
+            snprintf(buf, FEEDBACK_BUF_SIZE, "audio_monitor %i %f", eventptr->event.audio_monitor.index,
+                                                                    eventptr->event.audio_monitor.value);
+            socket_send_feedback_debug(buf);
+
+            // save for fast checkup next time
+            cached_audio_monitor.last_effect_id = eventptr->event.audio_monitor.index;
+            break;
+
         case POSTPONED_OUTPUT_MONITOR:
             if (eventptr->event.parameter.effect_id == ignored_effect_id)
                 continue;
-            if (ShouldIgnorePostPonedSymbolEvent(&eventptr->event.parameter, &cached_output_mon))
+            if (ShouldIgnorePostPonedSymbolEvent(eventptr->event.parameter.effect_id,
+                                                 eventptr->event.parameter.symbol,
+                                                 &cached_output_mon))
                 continue;
 
             snprintf(buf, FEEDBACK_BUF_SIZE, "output_set %i %s %f", eventptr->event.parameter.effect_id,
@@ -1285,6 +1532,14 @@ static void RunPostPonedEvents(int ignored_effect_id)
                                                                                  eventptr->event.midi_map.value,
                                                                                  eventptr->event.midi_map.minimum,
                                                                                  eventptr->event.midi_map.maximum);
+            socket_send_feedback_debug(buf);
+            break;
+
+        case POSTPONED_MIDI_CONTROL_CHANGE:
+            snprintf(buf, FEEDBACK_BUF_SIZE, "midi_control_change %i %i %i",
+                     eventptr->event.control_change.channel,
+                     eventptr->event.control_change.control,
+                     eventptr->event.control_change.value);
             socket_send_feedback_debug(buf);
             break;
 
@@ -1379,7 +1634,7 @@ static void RunPostPonedEvents(int ignored_effect_id)
                     jack_ringbuffer_read(effect->events_out_buffer, (char*)&key, sizeof(uint32_t));
                     jack_ringbuffer_read(effect->events_out_buffer, (char*)&atom, sizeof(LV2_Atom));
 
-                    char *body = calloc(1, atom.size);
+                    char *body = mod_calloc(1, atom.size);
                     jack_ringbuffer_read(effect->events_out_buffer, body, atom.size);
 
                     supported = true;
@@ -1534,6 +1789,18 @@ static void RunPostPonedEvents(int ignored_effect_id)
         }
     }
 
+    if (cpu_load_trigger)
+    {
+        snprintf(buf, FEEDBACK_BUF_SIZE, "cpu_load %f %f %d", jack_cpu_load(g_jack_global_client),
+                                                             #ifdef HAVE_JACK2_1_9_23
+                                                              jack_max_cpu_load(g_jack_global_client),
+                                                             #else
+                                                              0.f,
+                                                             #endif
+                                                              g_jack_xruns);
+        socket_send_feedback_debug(buf);
+    }
+
     if (g_verbose_debug) {
         puts("DEBUG: RunPostPonedEvents() After the queue iteration");
         fflush(stdout);
@@ -1543,12 +1810,22 @@ static void RunPostPonedEvents(int ignored_effect_id)
     postponed_cached_effect_list_data *peffect;
     postponed_cached_symbol_list_data *psymbol;
 
+    list_for_each_safe(it, it2, &cached_audio_monitor.effects.siblings)
+    {
+        peffect = list_entry(it, postponed_cached_effect_list_data, siblings);
+        free(peffect);
+    }
     list_for_each_safe(it, it2, &cached_process_out_buf.effects.siblings)
     {
         peffect = list_entry(it, postponed_cached_effect_list_data, siblings);
         free(peffect);
     }
     list_for_each_safe(it, it2, &cached_param_set.symbols.siblings)
+    {
+        psymbol = list_entry(it, postponed_cached_symbol_list_data, siblings);
+        free(psymbol);
+    }
+    list_for_each_safe(it, it2, &cached_param_state.symbols.siblings)
     {
         psymbol = list_entry(it, postponed_cached_symbol_list_data, siblings);
         free(psymbol);
@@ -1612,6 +1889,14 @@ static void RunPostPonedEvents(int ignored_effect_id)
 
 static void* PostPonedEventsThread(void* arg)
 {
+#if defined(_DARKGLASS_DEVICE_PABLITO)
+    setpriority(PRIO_PROCESS, gettid(), -18);
+#elif defined(_MOD_DEVICE_DUO) || defined(_MOD_DEVICE_DUOX) || defined(_MOD_DEVICE_DWARF)
+    const pid_t tid = syscall(SYS_gettid);
+    if (tid > 0)
+        setpriority(PRIO_PROCESS, tid, -18);
+#endif
+
     while (g_postevents_running == 1)
     {
         if (sem_timedwait_secs(&g_postevents_semaphore, 1) != 0)
@@ -1637,7 +1922,7 @@ static void* PostPonedEventsThread(void* arg)
     UNUSED_PARAM(arg);
 }
 
-#ifdef __MOD_DEVICES__
+#ifdef MOD_HMI_CONTROL_ENABLED
 static void* HMIClientThread(void* arg)
 {
     sys_serial_shm_data_channel* const data = (sys_serial_shm_data_channel*)arg;
@@ -1691,7 +1976,7 @@ static void* HMIClientThread(void* arg)
                 break;
 #endif
             case sys_serial_event_type_pedalboard_gain:
-                monitor_client_setup_volume(clampf(atof(msg), -30.0f, 20.0f));
+                monitor_client_setup_volume(clampf(atof(msg), MOD_MONITOR_VOLUME_MUTE, 20.0f));
                 break;
             default:
                 break;
@@ -1712,8 +1997,9 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
     if (arg == NULL) return 0;
     effect = arg;
 
-    if (!g_processing_enabled || (
-        (effect->hints & HINT_STATE_UNSAFE) && pthread_mutex_trylock(&effect->state_restore_mutex) != 0))
+    if ((effect->hints & HINT_IS_LIVE) == 0 &&
+        (!g_processing_enabled || (
+         (effect->hints & HINT_STATE_UNSAFE) && pthread_mutex_trylock(&effect->state_restore_mutex) != 0)))
     {
         for (i = 0; i < effect->output_audio_ports_count; i++)
         {
@@ -1891,18 +2177,17 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
     /* control in events */
     if (effect->events_in_buffer && effect->events_in_buffer_helper && effect->control_index >= 0)
     {
-        LV2_Atom atom;
         const size_t space = jack_ringbuffer_read_space(effect->events_in_buffer);
-        for (size_t j = 0; j < space; j += sizeof(atom) + atom.size)
+        LV2_Atom *atom = (LV2_Atom*)effect->events_in_buffer_helper;
+        port = effect->ports[effect->control_index];
+
+        for (size_t j = 0; j < space; j += sizeof(LV2_Atom) + atom->size)
         {
-            jack_ringbuffer_read(effect->events_in_buffer, (char*)&atom, sizeof(atom));
-            memcpy(effect->events_in_buffer_helper, &atom, sizeof(atom));
-            jack_ringbuffer_read(effect->events_in_buffer, effect->events_in_buffer_helper + sizeof(atom), atom.size);
-            port = effect->ports[effect->control_index];
+            jack_ringbuffer_read(effect->events_in_buffer, (char*)atom, sizeof(LV2_Atom));
+            jack_ringbuffer_read(effect->events_in_buffer, (char*)(atom + 1), atom->size);
+
             LV2_Evbuf_Iterator e = lv2_evbuf_end(port->evbuf);
-            const LV2_Atom* const ratom = (const LV2_Atom*)effect->events_in_buffer_helper;
-            lv2_evbuf_write(&e, nframes - 1, 0, ratom->type, ratom->size,
-                                LV2_ATOM_BODY_CONST(ratom));
+            lv2_evbuf_write(&e, nframes - 1, 0, atom->type, atom->size, (uint8_t*)(atom + 1));
         }
     }
 
@@ -1955,7 +2240,7 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
                 continue;
             }
 
-            if (SetPortValue(port, value, effect->instance, false)) {
+            if (SetPortValue(port, value, effect->instance, false, false)) {
                 needs_post = true;
                 cv_source->prev_value = value;
             }
@@ -1968,33 +2253,30 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
     {
         port = &effect->bypass_port;
 
-        if (pthread_mutex_trylock(&port->cv_source_mutex) == 0)
+        if (port->cv_source && pthread_mutex_trylock(&port->cv_source_mutex) == 0)
         {
-            if (port->cv_source)
-            {
-                cv_source_t *cv_source = port->cv_source;
+            cv_source_t *cv_source = port->cv_source;
 
-                value = ((float*)jack_port_get_buffer(cv_source->jack_port, 1))[0];
+            value = ((float*)jack_port_get_buffer(cv_source->jack_port, 1))[0];
 
-                // NOTE: values are reversed as this is bypass special behaviour
-                if (value <= cv_source->source_min_value) {
-                    value = cv_source->max_value;
+            // NOTE: values are reversed as this is bypass special behaviour
+            if (value <= cv_source->source_min_value) {
+                value = cv_source->max_value;
 
-                } else if (value >= cv_source->source_max_value) {
-                    value = cv_source->min_value;
+            } else if (value >= cv_source->source_max_value) {
+                value = cv_source->min_value;
 
-                } else {
-                    value = ((value - cv_source->source_min_value) / cv_source->source_diff_value) > 0.5f
-                          ? cv_source->min_value
-                          : cv_source->max_value;
-                }
+            } else {
+                value = ((value - cv_source->source_min_value) / cv_source->source_diff_value) > 0.5f
+                        ? cv_source->min_value
+                        : cv_source->max_value;
+            }
 
-                // ignore requests for same value
-                if (floats_differ_enough(cv_source->prev_value, value)) {
-                    if (SetPortValue(port, value, effect->instance, true)) {
-                        needs_post = true;
-                        cv_source->prev_value = value;
-                    }
+            // ignore requests for same value
+            if (floats_differ_enough(cv_source->prev_value, value)) {
+                if (SetPortValue(port, value, effect->instance, true, false)) {
+                    needs_post = true;
+                    cv_source->prev_value = value;
                 }
             }
 
@@ -2240,7 +2522,7 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
         {
             port = effect->input_control_ports[i];
 
-            if (port->hints & HINT_TRIGGER)
+            if ((port->hints & HINT_TRIGGER) && floats_differ_enough(port->prev_value, port->def_value))
                 port->prev_value = *(port->buffer) = port->def_value;
         }
     }
@@ -2290,7 +2572,7 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
     return 0;
 }
 
-static bool SetPortValue(port_t *port, float value, int effect_id, bool is_bypass)
+static bool SetPortValue(port_t *port, float value, int effect_id, bool is_bypass, bool from_ui)
 {
     bool update_transport = false;
 
@@ -2326,6 +2608,12 @@ static bool SetPortValue(port_t *port, float value, int effect_id, bool is_bypas
             g_transport_reset = true;
             update_transport = true;
         }
+    }
+    else if (!from_ui)
+    {
+#ifdef WITH_EXTERNAL_UI_SUPPORT
+        port->hints |= HINT_SHOULD_UPDATE;
+#endif
     }
 
     port->prev_value = *(port->buffer) = value;
@@ -2499,7 +2787,7 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
     jack_midi_event_t event;
     uint8_t channel;
     uint16_t controller;
-    uint8_t status_nibble, channel_nibble;
+    uint8_t status_nibble;
     uint16_t mvalue;
     float value;
     double dvalue;
@@ -2620,9 +2908,9 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
                             // set a sane low limit
                             if (dvalue <= 20.0)
                                 g_transport_bpm = 20;
-                            // >280 BPM over MIDI is unreasonable
-                            else if (dvalue >= 280.0)
-                                g_transport_bpm = 280.0;
+                            // >300 BPM over MIDI is unreasonable
+                            else if (dvalue >= 300.0)
+                                g_transport_bpm = 300.0;
                             // we are good!
                             else
                                 g_transport_bpm = dvalue;
@@ -2662,10 +2950,14 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
         // Handle MIDI program change
         if (status_nibble == 0xC0)
         {
-            channel_nibble = (event.buffer[0] & 0x0F);
+            channel = (event.buffer[0] & 0x0F);
 
-            if (g_monitored_midi_programs[channel_nibble] && event.size == 2)
+            if (g_monitored_midi_programs[channel] && event.size == 2)
             {
+#ifdef _DARKGLASS_PABLITO
+                if (event.buffer[1] == 0 || event.buffer[1] == 127)
+                    continue;
+#endif
                 // Append to the queue
                 postponed_event_list_data* const posteventptr = rtsafe_memory_pool_allocate_atomic(g_rtsafe_mem_pool);
 
@@ -2673,7 +2965,7 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
                   {
                       posteventptr->event.type = POSTPONED_MIDI_PROGRAM_CHANGE;
                       posteventptr->event.program_change.program = event.buffer[1];
-                      posteventptr->event.program_change.channel = channel_nibble;
+                      posteventptr->event.program_change.channel = channel;
 
                       pthread_mutex_lock(&g_rtsafe_mutex);
                       list_add_tail(&posteventptr->siblings, &g_rtsafe_list);
@@ -2757,12 +3049,86 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
                     break;
                 }
             }
+#ifdef _DARKGLASS_PABLITO
+            channel    = (event.buffer[0] & 0x0F);
+            switch (controller)
+            {
+            // these can be assigned to parameters, handle them first
+            case 17 ... 32:
+            case 89:
+                if (! g_monitored_midi_programs[channel])
+                    continue;
+
+                for (int j = 0; j < MAX_MIDI_CC_ASSIGN; j++)
+                {
+                    if (g_midi_cc_list[j].effect_id == ASSIGNMENT_NULL)
+                        break;
+                    if (g_midi_cc_list[j].effect_id == ASSIGNMENT_UNUSED)
+                        continue;
+
+                    if (g_midi_cc_list[j].controller == controller)
+                    {
+                        handled = true;
+                        value = UpdateValueFromMidi(&g_midi_cc_list[j], mvalue, highres);
+
+                        postponed_event_list_data* const posteventptr = rtsafe_memory_pool_allocate_atomic(g_rtsafe_mem_pool);
+
+                        if (posteventptr)
+                        {
+                            posteventptr->event.type = POSTPONED_PARAM_SET;
+                            posteventptr->event.parameter.effect_id = g_midi_cc_list[j].effect_id;
+                            posteventptr->event.parameter.symbol    = g_midi_cc_list[j].symbol;
+                            posteventptr->event.parameter.value     = value;
+
+                            pthread_mutex_lock(&g_rtsafe_mutex);
+                            list_add_tail(&posteventptr->siblings, &g_rtsafe_list);
+                            pthread_mutex_unlock(&g_rtsafe_mutex);
+
+                            needs_post = true;
+                        }
+
+                        break;
+                    }
+                }
+
+                if (needs_post)
+                    continue;
+
+            // fall-through
+            // if the special parameter CCs are not handled, report up as regular MIDI CC
+            case 0:
+            case 7:
+            case 14 ... 16:
+            case 85 ... 87:
+            case 102 ... 119:
+                if (g_monitored_midi_programs[channel])
+                {
+                    postponed_event_list_data* const posteventptr = rtsafe_memory_pool_allocate_atomic(g_rtsafe_mem_pool);
+
+                    if (posteventptr)
+                    {
+                        posteventptr->event.type = POSTPONED_MIDI_CONTROL_CHANGE;
+                        posteventptr->event.control_change.channel = channel;
+                        posteventptr->event.control_change.control = controller;
+                        posteventptr->event.control_change.value = mvalue;
+
+                        pthread_mutex_lock(&g_rtsafe_mutex);
+                        list_add_tail(&posteventptr->siblings, &g_rtsafe_list);
+                        pthread_mutex_unlock(&g_rtsafe_mutex);
+
+                        needs_post = true;
+                    }
+                }
+                continue;
+            }
+#else
         }
         else if (status_nibble == 0xE0)
         {
             controller = MIDI_PITCHBEND_AS_CC;
             mvalue     = (event.buffer[2] << 7) | event.buffer[1];
             highres    = true;
+#endif
         }
         else
         {
@@ -2779,9 +3145,16 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
             if (g_midi_cc_list[j].effect_id == ASSIGNMENT_UNUSED)
                 continue;
 
+#ifdef _DARKGLASS_PABLITO
+            if (! g_monitored_midi_programs[channel])
+                continue;
+#else
+            if (g_midi_cc_list[j].channel != channel)
+                continue;
+#endif
+
             // TODO: avoid race condition against effects_midi_unmap
-            if (g_midi_cc_list[j].channel    == channel &&
-                g_midi_cc_list[j].controller == controller)
+            if (g_midi_cc_list[j].controller == controller)
             {
                 handled = true;
                 value = UpdateValueFromMidi(&g_midi_cc_list[j], mvalue, highres);
@@ -2857,6 +3230,24 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
                     needs_post = true;
                 }
             }
+            else if (g_monitored_midi_programs[channel])
+            {
+                postponed_event_list_data* const posteventptr = rtsafe_memory_pool_allocate_atomic(g_rtsafe_mem_pool);
+
+                if (posteventptr)
+                {
+                    posteventptr->event.type = POSTPONED_MIDI_CONTROL_CHANGE;
+                    posteventptr->event.control_change.channel = channel;
+                    posteventptr->event.control_change.control = controller;
+                    posteventptr->event.control_change.value = mvalue;
+
+                    pthread_mutex_lock(&g_rtsafe_mutex);
+                    list_add_tail(&posteventptr->siblings, &g_rtsafe_list);
+                    pthread_mutex_unlock(&g_rtsafe_mutex);
+
+                    needs_post = true;
+                }
+            }
         }
     }
 
@@ -2870,16 +3261,20 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
     switch (g_noisegate_channel)
     {
     case 0: // no gate
-        memcpy(audio_out1_buf, audio_in1_buf, sizeof(float)*nframes);
-        memcpy(audio_out2_buf, audio_in2_buf, sizeof(float)*nframes);
+        if (audio_out1_buf != audio_in1_buf)
+            memcpy(audio_out1_buf, audio_in1_buf, sizeof(float)*nframes);
+        if (audio_out2_buf != audio_in2_buf)
+            memcpy(audio_out2_buf, audio_in2_buf, sizeof(float)*nframes);
         break;
     case 1: // left channel only
-        memcpy(audio_out2_buf, audio_in2_buf, sizeof(float)*nframes);
+        if (audio_out2_buf != audio_in2_buf)
+            memcpy(audio_out2_buf, audio_in2_buf, sizeof(float)*nframes);
         for (uint32_t i=0; i<nframes; ++i)
             audio_out1_buf[i] = gate_push_sample_and_apply(&g_noisegate, audio_in1_buf[i]);
         break;
     case 2: // right channel only
-        memcpy(audio_out1_buf, audio_in1_buf, sizeof(float)*nframes);
+        if (audio_out1_buf != audio_in1_buf)
+            memcpy(audio_out1_buf, audio_in1_buf, sizeof(float)*nframes);
         for (uint32_t i=0; i<nframes; ++i)
             audio_out2_buf[i] = gate_push_sample_and_apply(&g_noisegate, audio_in2_buf[i]);
         break;
@@ -2894,8 +3289,63 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
     }
 #endif
 
+    // Handle audio monitors
+    if (pthread_mutex_trylock(&g_audio_monitor_mutex) == 0)
+    {
+        float *monitorbuf;
+        float absvalue, oldvalue;
+
+        for (int i = 0; i < g_audio_monitor_count; ++i)
+        {
+            monitorbuf = (float*)jack_port_get_buffer(g_audio_monitors[i].port, nframes);
+            oldvalue = value = g_audio_monitors[i].value;
+
+            for (jack_nframes_t i = 0 ; i < nframes; i++)
+            {
+                absvalue = fabsf(monitorbuf[i]);
+
+                if (absvalue > value)
+                    value = absvalue;
+            }
+
+            if (oldvalue < value)
+            {
+                g_audio_monitors[i].value = value;
+
+                postponed_event_list_data* const posteventptr = rtsafe_memory_pool_allocate_atomic(g_rtsafe_mem_pool);
+
+                if (posteventptr)
+                {
+                    posteventptr->event.type = POSTPONED_AUDIO_MONITOR;
+                    posteventptr->event.audio_monitor.index = i;
+                    posteventptr->event.audio_monitor.value = value;
+
+                    pthread_mutex_lock(&g_rtsafe_mutex);
+                    list_add_tail(&posteventptr->siblings, &g_rtsafe_list);
+                    pthread_mutex_unlock(&g_rtsafe_mutex);
+
+                    needs_post = true;
+                }
+            }
+        }
+
+        pthread_mutex_unlock(&g_audio_monitor_mutex);
+    }
+
     if (UpdateGlobalJackPosition(pos_flag, false))
         needs_post = true;
+
+    if (g_cpu_load_enabled)
+    {
+        const uint32_t cpu_update_rate = g_sample_rate / 2;
+        const uint32_t frame_check = g_monotonic_frame_count % cpu_update_rate;
+
+        if (frame_check + nframes >= cpu_update_rate)
+        {
+            g_cpu_load_trigger = true;
+            needs_post = true;
+        }
+    }
 
     if (needs_post)
         sem_post(&g_postevents_semaphore);
@@ -3048,7 +3498,7 @@ static void JackThreadInit(void* arg)
 
 static void GetFeatures(effect_t *effect)
 {
-    const LV2_Feature **features = (const LV2_Feature**) calloc(FEATURE_TERMINATOR+1, sizeof(LV2_Feature*));
+    const LV2_Feature **features = (const LV2_Feature**) mod_calloc(FEATURE_TERMINATOR+1, sizeof(LV2_Feature*));
 
     /* URI and URID Features are the same for all instances (global declaration) */
 
@@ -3073,6 +3523,16 @@ static void GetFeatures(effect_t *effect)
     ctrlportReqChange_feature->URI = LV2_CONTROL_INPUT_PORT_CHANGE_REQUEST_URI;
     ctrlportReqChange_feature->data = ctrlportReqChange;
 
+    /* Control Port state update feature, includes custom pointer */
+    LV2_Control_Port_State_Update *ctrlportStateUpdate
+        = (LV2_Control_Port_State_Update*) malloc(sizeof(LV2_Control_Port_State_Update));
+    ctrlportStateUpdate->handle = effect;
+    ctrlportStateUpdate->update_state = UpdateControlPortState;
+
+    LV2_Feature *ctrlportStateUpdate_feature = (LV2_Feature*) malloc(sizeof(LV2_Feature));
+    ctrlportStateUpdate_feature->URI = LV2_CONTROL_PORT_STATE_UPDATE_URI;
+    ctrlportStateUpdate_feature->data = ctrlportStateUpdate;
+
     /* Worker Feature, must be last as it can be null */
     LV2_Feature *work_schedule_feature = NULL;
 
@@ -3094,7 +3554,7 @@ static void GetFeatures(effect_t *effect)
     features[URID_MAP_FEATURE]          = &g_urid_map_feature;
     features[URID_UNMAP_FEATURE]        = &g_urid_unmap_feature;
     features[OPTIONS_FEATURE]           = &g_options_feature;
-#ifdef __MOD_DEVICES__
+#ifdef MOD_HMI_CONTROL_ENABLED
     features[HMI_WC_FEATURE]            = &g_hmi_wc_feature;
 #endif
     features[LICENSE_FEATURE]           = &g_license_feature;
@@ -3105,10 +3565,18 @@ static void GetFeatures(effect_t *effect)
     features[STATE_FREE_PATH_FEATURE]   = &g_state_freePath_feature;
     features[STATE_MAKE_PATH_FEATURE]   = state_make_path_feature;
     features[CTRLPORT_REQUEST_FEATURE]  = ctrlportReqChange_feature;
+    features[CTRLPORT_STATE_FEATURE]    = ctrlportStateUpdate_feature;
     features[WORKER_FEATURE]            = work_schedule_feature;
+#ifdef WITH_EXTERNAL_UI_SUPPORT
+    features[UI_DATA_ACCESS]            = NULL;
+    features[UI_INSTANCE_ACCESS]        = NULL;
+#endif
     features[FEATURE_TERMINATOR]        = NULL;
 
     effect->features = features;
+
+    /* also update jack client option value */
+    g_options[7].value = effect->jack_client;
 }
 
 /**
@@ -3219,16 +3687,14 @@ static const void* GetPortValueForState(const char* symbol, void* user_data, uin
     return NULL;
 }
 
-static int LoadPresets(effect_t *effect)
+static void LoadPresets(effect_t *effect)
 {
     LilvNodes* presets = lilv_plugin_get_related(effect->lilv_plugin, g_lilv_nodes.preset);
     uint32_t presets_count = lilv_nodes_size(presets);
     effect->presets_count = presets_count;
     // allocate for presets
-    effect->presets = (preset_t **) calloc(presets_count, sizeof(preset_t *));
+    effect->presets = (preset_t **) mod_calloc(presets_count, sizeof(preset_t *));
     uint32_t j = 0;
-    for (j = 0; j < presets_count; j++) effect->presets[j] = NULL;
-    j = 0;
     LILV_FOREACH(nodes, i, presets)
     {
         const LilvNode* preset = lilv_nodes_get(presets, i);
@@ -3237,8 +3703,6 @@ static int LoadPresets(effect_t *effect)
         j++;
     }
     lilv_nodes_free(presets);
-
-    return 0;
 }
 
 // ignore const cast for this function, need to free const features array
@@ -3267,6 +3731,11 @@ static void FreeFeatures(effect_t *effect)
         {
             free(effect->features[CTRLPORT_REQUEST_FEATURE]->data);
             free((void*)effect->features[CTRLPORT_REQUEST_FEATURE]);
+        }
+        if (effect->features[CTRLPORT_STATE_FEATURE])
+        {
+            free(effect->features[CTRLPORT_STATE_FEATURE]->data);
+            free((void*)effect->features[CTRLPORT_STATE_FEATURE]);
         }
         if (effect->features[WORKER_FEATURE])
         {
@@ -3389,7 +3858,7 @@ static void ConnectToMIDIThroughPorts(void)
     }
 }
 
-#ifdef __MOD_DEVICES__
+#ifdef MOD_HMI_CONTROL_ENABLED
 static void HMIWidgetsSetLedWithBlink(LV2_HMI_WidgetControl_Handle handle,
                                       LV2_HMI_Addressing addressing_ptr,
                                       LV2_HMI_LED_Colour led_color,
@@ -3684,7 +4153,7 @@ static char* GetLicenseFile(MOD_License_Handle handle, const char *license_uri)
         goto end;
 
     // allocate file buffer
-    filebuffer = (char*)calloc(1, filesize+1);
+    filebuffer = (char*)mod_calloc(1, filesize+1);
     if (! filebuffer)
         goto end;
 
@@ -3809,7 +4278,8 @@ static int LogVPrintf(LV2_Log_Handle handle, LV2_URID type, const char* fmt, va_
 }
 
 static LV2_ControlInputPort_Change_Status RequestControlPortChange(LV2_ControlInputPort_Change_Request_Handle handle,
-                                                                   uint32_t index, float value)
+                                                                   uint32_t index,
+                                                                   float value)
 {
     effect_t *effect = (effect_t*)handle;
 
@@ -3825,10 +4295,69 @@ static LV2_ControlInputPort_Change_Status RequestControlPortChange(LV2_ControlIn
     if (!floats_differ_enough(port->prev_value, value))
         return LV2_CONTROL_INPUT_PORT_CHANGE_SUCCESS;
 
-    if (SetPortValue(port, value, effect->instance, false))
+    if (SetPortValue(port, value, effect->instance, false, false))
         sem_post(&g_postevents_semaphore);
 
     return LV2_CONTROL_INPUT_PORT_CHANGE_SUCCESS;
+}
+
+static LV2_Control_Port_State_Update_Status UpdateControlPortState(LV2_Control_Port_State_Update_Handle handle,
+                                                                   uint32_t index,
+                                                                   LV2_Control_Port_State state)
+{
+    effect_t *effect = (effect_t*)handle;
+
+    if (index >= effect->ports_count)
+        return LV2_CONTROL_PORT_STATE_UPDATE_ERR_INVALID_INDEX;
+
+    port_t *port = effect->ports[index];
+
+    if (port->type != TYPE_CONTROL)
+        return LV2_CONTROL_PORT_STATE_UPDATE_ERR_INVALID_INDEX;
+
+    LV2_Control_Port_State curstate;
+    if (port->hints & HINT_STATE_BLOCKED)
+        curstate = LV2_CONTROL_PORT_STATE_BLOCKED;
+    else if (port->hints & HINT_STATE_INACTIVE)
+        curstate = LV2_CONTROL_PORT_STATE_INACTIVE;
+    else
+        curstate = LV2_CONTROL_PORT_STATE_NONE;
+
+    if (curstate == state)
+        return LV2_CONTROL_PORT_STATE_UPDATE_SUCCESS;
+
+    postponed_event_list_data* const posteventptr =
+        rtsafe_memory_pool_allocate_atomic(g_rtsafe_mem_pool);
+
+    if (posteventptr == NULL)
+        return LV2_CONTROL_PORT_STATE_UPDATE_ERR_UNKNOWN;
+
+    switch (state)
+    {
+    case LV2_CONTROL_PORT_STATE_NONE:
+        port->hints &= ~(HINT_STATE_INACTIVE|HINT_STATE_BLOCKED);
+        break;
+    case LV2_CONTROL_PORT_STATE_INACTIVE:
+        port->hints |= HINT_STATE_INACTIVE;
+        port->hints &= ~HINT_STATE_BLOCKED;
+        break;
+    case LV2_CONTROL_PORT_STATE_BLOCKED:
+        port->hints |= HINT_STATE_INACTIVE|HINT_STATE_BLOCKED;
+        break;
+    }
+
+    posteventptr->event.type = POSTPONED_PARAM_STATE;
+    posteventptr->event.state.effect_id = effect->instance;
+    posteventptr->event.state.symbol    = port->symbol;
+    posteventptr->event.state.state     = state;
+
+    pthread_mutex_lock(&g_rtsafe_mutex);
+    list_add_tail(&posteventptr->siblings, &g_rtsafe_list);
+    pthread_mutex_unlock(&g_rtsafe_mutex);
+
+    sem_post(&g_postevents_semaphore);
+
+    return LV2_CONTROL_PORT_STATE_UPDATE_SUCCESS;
 }
 
 static char* MakePluginStatePathFromSratchDir(LV2_State_Make_Path_Handle handle, const char *path)
@@ -3880,7 +4409,7 @@ static void CCDataUpdate(void* arg)
             continue;
         }
 
-        if (SetPortValue(assignment->port, data->value, assignment->effect_id, is_bypass))
+        if (SetPortValue(assignment->port, data->value, assignment->effect_id, is_bypass, false))
             needs_post = true;
     }
 
@@ -3902,28 +4431,39 @@ static bool CheckCCDeviceProtocolVersion(int device_id, int major, int minor)
     char *descriptor = cc_client_device_descriptor(g_cc_client, device_id);
 
     if (!descriptor)
+    {
+        printf("CheckCCDeviceProtocolVersion error: failed to get device descriptor with id %i\n", device_id);
         return false;
+    }
 
     // we quickly parse the json ourselves in order to prevent adding more dependencies into mod-host
     const char *vsplit, *vstart, *vend;
-    char buf_major[8], buf_minor[8], *buf = buf_major;
-    int device_major, device_minor;
 
     vsplit = strstr(descriptor, "\"protocol\":");
-    if (! vsplit)
+    if (!vsplit)
+    {
+        puts("CheckCCDeviceProtocolVersion error: failed to find protocol field");
         goto free;
+    }
 
     vstart = strstr(vsplit+10, "\"");
-    if (! vstart)
+    if (!vstart)
+    {
+        puts("CheckCCDeviceProtocolVersion error: failed to find protocol field start");
         goto free;
+    }
     ++vstart;
 
     vend = strstr(vstart, "\"");
-    if (! vend)
+    if (!vend)
+    {
+        puts("CheckCCDeviceProtocolVersion error: failed to find protocol field end");
         goto free;
+    }
 
-    memset(buf_major, 0, sizeof(buf_major));
-    memset(buf_minor, 0, sizeof(buf_minor));
+    char buf_major[8] = {0};
+    char buf_minor[8] = {0};
+    char *buf = buf_major;
 
     for (int i=0; i<7; ++vstart)
     {
@@ -3943,8 +4483,8 @@ static bool CheckCCDeviceProtocolVersion(int device_id, int major, int minor)
         break;
     }
 
-    device_major = atoi(buf_major);
-    device_minor = atoi(buf_minor);
+    const int device_major = atoi(buf_major);
+    const int device_minor = atoi(buf_minor);
 
     free(descriptor);
     return device_major >= major && device_minor >= minor;
@@ -3964,6 +4504,39 @@ static uint32_t GetHyliaOutputLatency(void)
         return (uint32_t)latency;
 
     return 0;
+}
+#endif
+
+#ifdef WITH_EXTERNAL_UI_SUPPORT
+static void ExternalControllerWriteFunction(LV2UI_Controller controller,
+                                            uint32_t port_index,
+                                            uint32_t buffer_size,
+                                            uint32_t port_protocol,
+                                            const void *buffer)
+{
+    if (port_protocol != 0)
+    {
+        printf("ExternalControllerWriteFunction %p %u %u %u %p\n", controller, port_index, buffer_size, port_protocol, buffer);
+        return;
+    }
+
+    effect_t *effect = (effect_t*)controller;
+
+    if (port_index >= effect->ports_count)
+        return;
+
+    port_t *port = effect->ports[port_index];
+    const float value = *((const float*)buffer);
+
+    if (port->type != TYPE_CONTROL || port->flow != FLOW_INPUT)
+        return;
+
+    // ignore requests for same value
+    if (!floats_differ_enough(port->prev_value, value))
+        return;
+
+    if (SetPortValue(port, value, effect->instance, false, true))
+        sem_post(&g_postevents_semaphore);
 }
 #endif
 
@@ -4042,6 +4615,9 @@ int effects_init(void* client)
             jack_client_close(g_jack_global_client);
         return ERR_JACK_PORT_REGISTER;
     }
+
+    jack_port_tie(g_audio_in1_port, g_audio_out1_port);
+    jack_port_tie(g_audio_in2_port, g_audio_out2_port);
 #endif
 
     if (g_jack_global_client != NULL && strcmp(jack_get_client_name(g_jack_global_client), "mod-host") == 0 && ! monitor_client_init())
@@ -4054,8 +4630,7 @@ int effects_init(void* client)
     INIT_LIST_HEAD(&g_rtsafe_list);
     INIT_LIST_HEAD(&g_raw_midi_port_list);
 
-    if (!rtsafe_memory_pool_create(&g_rtsafe_mem_pool, "mod-host", sizeof(postponed_event_list_data),
-                                   MAX_POSTPONED_EVENTS))
+    if (!rtsafe_memory_pool_create(&g_rtsafe_mem_pool, sizeof(postponed_event_list_data), MAX_POSTPONED_EVENTS))
     {
         fprintf(stderr, "can't allocate realtime-safe memory pool\n");
         if (client == NULL)
@@ -4071,8 +4646,10 @@ int effects_init(void* client)
 
     pthread_mutex_init(&g_rtsafe_mutex, &mutex_atts);
     pthread_mutex_init(&g_raw_midi_port_mutex, &mutex_atts);
+    pthread_mutex_init(&g_audio_monitor_mutex, &mutex_atts);
     pthread_mutex_init(&g_midi_learning_mutex, &mutex_atts);
-#ifdef __MOD_DEVICES__
+    pthread_mutex_init(&g_sync_scheduled_params_mutex, &mutex_atts);
+#ifdef MOD_HMI_CONTROL_ENABLED
     pthread_mutex_init(&g_hmi_mutex, &mutex_atts);
 #endif
 
@@ -4085,6 +4662,7 @@ int effects_init(void* client)
     /* Get buffers size */
     g_block_length = jack_get_buffer_size(g_jack_global_client);
     g_sample_rate = jack_get_sample_rate(g_jack_global_client);
+    g_sample_rate_f = g_sample_rate;
     g_midi_buffer_size = jack_port_type_get_buffer_size(g_jack_global_client, JACK_DEFAULT_MIDI_TYPE);
     g_max_allowed_midi_delta = (jack_nframes_t)(g_sample_rate * 0.2); // max 200ms of allowed delta
 
@@ -4177,6 +4755,7 @@ int effects_init(void* client)
         effect->control_index = -1;
         effect->enabled_index = -1;
         effect->freewheel_index = -1;
+        effect->reset_index = -1;
         effect->bpb_index = -1;
         effect->bpm_index = -1;
         effect->speed_index = -1;
@@ -4220,6 +4799,7 @@ int effects_init(void* client)
     jack_set_process_callback(g_jack_global_client, ProcessGlobalClient, NULL);
     jack_set_buffer_size_callback(g_jack_global_client, BufferSize, NULL);
     jack_set_port_registration_callback(g_jack_global_client, PortRegistration, NULL);
+    jack_set_xrun_callback(g_jack_global_client, XRun, NULL);
 
 #ifdef HAVE_HYLIA
     /* Init hylia */
@@ -4236,6 +4816,9 @@ int effects_init(void* client)
 
     /* Load all LV2 data */
     g_lv2_data = lilv_world_new();
+#ifdef LILV_OPTION_OBJECT_INDEX
+    lilv_world_set_option(g_lv2_data, LILV_OPTION_OBJECT_INDEX, NULL);
+#endif
     lilv_world_load_all(g_lv2_data);
     g_plugins = lilv_world_get_all_plugins(g_lv2_data);
 
@@ -4254,6 +4837,7 @@ int effects_init(void* client)
     g_lilv_nodes.input = lilv_new_uri(g_lv2_data, LILV_URI_INPUT_PORT);
     g_lilv_nodes.integer = lilv_new_uri(g_lv2_data, LV2_CORE__integer);
     g_lilv_nodes.license_interface = lilv_new_uri(g_lv2_data, MOD_LICENSE__interface);
+    g_lilv_nodes.is_live = lilv_new_uri(g_lv2_data, LV2_CORE__isLive);
     g_lilv_nodes.logarithmic = lilv_new_uri(g_lv2_data, LV2_PORT_PROPS__logarithmic);
     g_lilv_nodes.maximum = lilv_new_uri(g_lv2_data, LV2_CORE__maximum);
     g_lilv_nodes.midiEvent = lilv_new_uri(g_lv2_data, LV2_MIDI__MidiEvent);
@@ -4283,6 +4867,7 @@ int effects_init(void* client)
     g_lilv_nodes.preset = lilv_new_uri(g_lv2_data, LV2_PRESETS__Preset);
     g_lilv_nodes.rawMIDIClockAccess = lilv_new_uri(g_lv2_data, LILV_NS_MOD "rawMIDIClockAccess");
     g_lilv_nodes.rdfs_range = lilv_new_uri(g_lv2_data, LILV_NS_RDFS "range");
+    g_lilv_nodes.reset = lilv_new_uri(g_lv2_data, LV2_KXSTUDIO_PROPERTIES__Reset);
     g_lilv_nodes.sample_rate = lilv_new_uri(g_lv2_data, LV2_CORE__sampleRate);
     g_lilv_nodes.state_interface = lilv_new_uri(g_lv2_data, LV2_STATE__interface);
     g_lilv_nodes.state_load_default_state = lilv_new_uri(g_lv2_data, LV2_STATE__loadDefaultState);
@@ -4325,6 +4910,8 @@ int effects_init(void* client)
     g_urids.bufsz_nomimalBlockLength = urid_to_id(g_symap, LV2_BUF_SIZE__nominalBlockLength);
     g_urids.bufsz_sequenceSize   = urid_to_id(g_symap, LV2_BUF_SIZE__sequenceSize);
 
+    g_urids.jack_client          = urid_to_id(g_symap, "http://jackaudio.org/metadata/client");
+
     g_urids.log_Error            = urid_to_id(g_symap, LV2_LOG__Error);
     g_urids.log_Note             = urid_to_id(g_symap, LV2_LOG__Note);
     g_urids.log_Trace            = urid_to_id(g_symap, LV2_LOG__Trace);
@@ -4346,7 +4933,7 @@ int effects_init(void* client)
     g_urids.time_beatUnit        = urid_to_id(g_symap, LV2_TIME__beatUnit);
     g_urids.time_beatsPerBar     = urid_to_id(g_symap, LV2_TIME__beatsPerBar);
     g_urids.time_beatsPerMinute  = urid_to_id(g_symap, LV2_TIME__beatsPerMinute);
-    g_urids.time_ticksPerBeat    = urid_to_id(g_symap, KX_TIME__TicksPerBeat);
+    g_urids.time_ticksPerBeat    = urid_to_id(g_symap, LV2_KXSTUDIO_PROPERTIES__TimePositionTicksPerBeat);
     g_urids.time_frame           = urid_to_id(g_symap, LV2_TIME__frame);
     g_urids.time_speed           = urid_to_id(g_symap, LV2_TIME__speed);
 
@@ -4358,8 +4945,8 @@ int effects_init(void* client)
     g_options[0].subject = 0;
     g_options[0].key = g_urids.param_sampleRate;
     g_options[0].size = sizeof(float);
-    g_options[0].type = g_urids.atom_Int;
-    g_options[0].value = &g_block_length;
+    g_options[0].type = g_urids.atom_Float;
+    g_options[0].value = &g_sample_rate_f;
 
     g_options[1].context = LV2_OPTIONS_INSTANCE;
     g_options[1].subject = 0;
@@ -4405,12 +4992,19 @@ int effects_init(void* client)
 
     g_options[7].context = LV2_OPTIONS_INSTANCE;
     g_options[7].subject = 0;
-    g_options[7].key = 0;
-    g_options[7].size = 0;
-    g_options[7].type = 0;
+    g_options[7].key = g_urids.jack_client;
+    g_options[7].size = sizeof(jack_client_t*);
+    g_options[7].type = g_urids.jack_client;
     g_options[7].value = NULL;
 
-#ifdef __MOD_DEVICES__
+    g_options[8].context = LV2_OPTIONS_INSTANCE;
+    g_options[8].subject = 0;
+    g_options[8].key = 0;
+    g_options[8].size = 0;
+    g_options[8].type = 0;
+    g_options[8].value = NULL;
+
+#ifdef MOD_HMI_CONTROL_ENABLED
     g_hmi_wc.size                    = sizeof(g_hmi_wc);
     g_hmi_wc.set_led_with_blink      = HMIWidgetsSetLedWithBlink;
     g_hmi_wc.set_led_with_brightness = HMIWidgetsSetLedWithBrightness;
@@ -4427,7 +5021,7 @@ int effects_init(void* client)
         {
             g_hmi_wc.handle = g_hmi_data;
             sys_serial_write(&g_hmi_data->server, sys_serial_event_type_special_req, 0, 0, "restart");
-            pthread_create(&g_hmi_client_thread, NULL, HMIClientThread, &g_hmi_data->client);
+            zix_thread_create(&g_hmi_client_thread, 0, HMIClientThread, &g_hmi_data->client);
         }
         else
         {
@@ -4438,10 +5032,10 @@ int effects_init(void* client)
 
     for (int i = 0; i < MAX_HMI_ADDRESSINGS; i++)
         g_hmi_addressings[i].actuator_id = -1;
+#endif
 
 #ifdef MOD_IO_PROCESSING_ENABLED
     gate_init(&g_noisegate);
-#endif
 #endif
 
     g_license.handle = NULL;
@@ -4473,6 +5067,7 @@ int effects_init(void* client)
     }
     g_midi_learning = NULL;
 
+    memset(g_monitored_midi_controls, 0, sizeof(g_monitored_midi_controls));
     memset(g_monitored_midi_programs, 0, sizeof(g_monitored_midi_programs));
 
 #ifdef HAVE_CONTROLCHAIN
@@ -4492,7 +5087,7 @@ int effects_init(void* client)
     /* Start the thread that consumes from the event queue */
     g_postevents_running = 1;
     g_postevents_ready = true;
-    pthread_create(&g_postevents_thread, NULL, PostPonedEventsThread, NULL);
+    zix_thread_create(&g_postevents_thread, 0, PostPonedEventsThread, NULL);
 
     /* get transport state */
     UpdateGlobalJackPosition(UPDATE_POSITION_SKIP, false);
@@ -4563,21 +5158,21 @@ int effects_finish(int close_client)
 {
     g_postevents_running = -1;
     sem_post(&g_postevents_semaphore);
-    pthread_join(g_postevents_thread, NULL);
+    zix_thread_join(g_postevents_thread, NULL);
 
-    if (close_client)
+    if (close_client && g_jack_global_client != NULL && strcmp(jack_get_client_name(g_jack_global_client), "mod-host") == 0)
         monitor_client_stop();
 
     effects_remove(REMOVE_ALL);
 
-#ifdef __MOD_DEVICES__
+#ifdef MOD_HMI_CONTROL_ENABLED
     if (g_hmi_data != NULL)
     {
         sys_serial_shm_data* hmi_data = g_hmi_data;
         g_hmi_data = NULL;
 
         sem_post(&hmi_data->client.sem);
-        pthread_join(g_hmi_client_thread, NULL);
+        zix_thread_join(g_hmi_client_thread, NULL);
 
         sys_serial_close(g_hmi_shmfd, hmi_data);
     }
@@ -4610,6 +5205,7 @@ int effects_finish(int close_client)
     lilv_node_free(g_lilv_nodes.integer);
     lilv_node_free(g_lilv_nodes.license_interface);
     lilv_node_free(g_lilv_nodes.logarithmic);
+    lilv_node_free(g_lilv_nodes.is_live);
     lilv_node_free(g_lilv_nodes.maximum);
     lilv_node_free(g_lilv_nodes.midiEvent);
     lilv_node_free(g_lilv_nodes.minimum);
@@ -4627,6 +5223,7 @@ int effects_finish(int close_client)
     lilv_node_free(g_lilv_nodes.preset);
     lilv_node_free(g_lilv_nodes.rawMIDIClockAccess);
     lilv_node_free(g_lilv_nodes.rdfs_range);
+    lilv_node_free(g_lilv_nodes.reset);
     lilv_node_free(g_lilv_nodes.sample_rate);
     lilv_node_free(g_lilv_nodes.state_interface);
     lilv_node_free(g_lilv_nodes.state_load_default_state);
@@ -4643,8 +5240,10 @@ int effects_finish(int close_client)
     sem_destroy(&g_postevents_semaphore);
     pthread_mutex_destroy(&g_rtsafe_mutex);
     pthread_mutex_destroy(&g_raw_midi_port_mutex);
+    pthread_mutex_destroy(&g_audio_monitor_mutex);
     pthread_mutex_destroy(&g_midi_learning_mutex);
-#ifdef __MOD_DEVICES__
+    pthread_mutex_destroy(&g_sync_scheduled_params_mutex);
+#ifdef MOD_HMI_CONTROL_ENABLED
     pthread_mutex_destroy(&g_hmi_mutex);
 #endif
 
@@ -4669,7 +5268,7 @@ int effects_finish(int close_client)
     return SUCCESS;
 }
 
-int effects_add(const char *uri, int instance)
+int effects_add(const char *uri, int instance, int activate)
 {
     unsigned int ports_count;
     char effect_name[32], port_name[MAX_CHAR_BUF_SIZE+1];
@@ -4699,7 +5298,7 @@ int effects_add(const char *uri, int instance)
     const LilvPort *control_in_port;
     const LilvPort *lilv_port;
     const LilvNode *symbol_node;
-    uint32_t control_in_size, control_out_size;
+    uint32_t control_in_size, control_out_size, worker_buf_size;
 
     if (!uri) return ERR_LV2_INVALID_URI;
     if (!INSTANCE_IS_VALID(instance)) return ERR_INSTANCE_INVALID;
@@ -4708,8 +5307,9 @@ int effects_add(const char *uri, int instance)
     effect = &g_effects[instance];
 
     /* Init the struct */
-    memset(effect, 0, sizeof(effect_t));
+    mod_memset(effect, 0, sizeof(effect_t));
     effect->instance = instance;
+    effect->activated = activate;
 
     /* Init the pointers */
     plugin_uri = NULL;
@@ -4774,6 +5374,33 @@ int effects_add(const char *uri, int instance)
     }
     effect->lilv_instance = lilv_instance;
 
+    /* query control_in port and its minimum size */
+    control_out_size = 0;
+    worker_buf_size = 4096;
+    control_in_port = lilv_plugin_get_port_by_designation(plugin, g_lilv_nodes.input, g_lilv_nodes.control_in);
+    if (control_in_port)
+    {
+        control_in_size = g_midi_buffer_size * 16; // 16 taken from jalv source code
+        effect->control_index = lilv_port_get_index(plugin, control_in_port);
+
+        LilvNodes *lilvminsize = lilv_port_get_value(plugin, control_in_port, g_lilv_nodes.minimumSize);
+        if (lilvminsize != NULL)
+        {
+            const int minsize = lilv_node_as_int(lilv_nodes_get_first(lilvminsize));
+            if (minsize > 0 && (uint)minsize > worker_buf_size)
+                worker_buf_size = minsize;
+        }
+    }
+    else
+    {
+        control_in_size = 0;
+        effect->control_index = -1;
+    }
+
+    /* Query plugin features */
+    if (lilv_plugin_has_feature(effect->lilv_plugin, g_lilv_nodes.is_live))
+        effect->hints |= HINT_IS_LIVE;
+
     /* Query plugin extensions/interfaces */
     if (lilv_plugin_has_extension_data(effect->lilv_plugin, g_lilv_nodes.worker_interface))
     {
@@ -4781,7 +5408,7 @@ int effects_add(const char *uri, int instance)
             (const LV2_Worker_Interface*) lilv_instance_get_extension_data(effect->lilv_instance,
                                                                            LV2_WORKER__interface);
 
-        worker_init(&effect->worker, lilv_instance, worker_interface);
+        worker_init(&effect->worker, lilv_instance, worker_interface, worker_buf_size);
     }
 
     if (lilv_plugin_has_extension_data(effect->lilv_plugin, g_lilv_nodes.options_interface))
@@ -4853,25 +5480,12 @@ int effects_add(const char *uri, int instance)
     effect->monitors_count = 0;
     effect->monitors = NULL;
     effect->ports_count = ports_count;
-    effect->ports = (port_t **) calloc(ports_count, sizeof(port_t *));
-
-    control_in_port = lilv_plugin_get_port_by_designation(plugin, g_lilv_nodes.input, g_lilv_nodes.control_in);
-    if (control_in_port)
-    {
-        control_in_size = g_midi_buffer_size * 16; // 16 taken from jalv source code
-        effect->control_index = lilv_port_get_index(plugin, control_in_port);
-    }
-    else
-    {
-        control_in_size = 0;
-        effect->control_index = -1;
-    }
-    control_out_size = 0;
+    effect->ports = (port_t **) mod_calloc(ports_count, sizeof(port_t *));
 
     for (unsigned int i = 0; i < ports_count; i++)
     {
         /* Allocate memory to current port */
-        effect->ports[i] = port = (port_t *) calloc(1, sizeof(port_t));
+        effect->ports[i] = port = (port_t *) mod_calloc(1, sizeof(port_t));
 
         pthread_mutex_init(&port->cv_source_mutex, &mutex_atts);
 
@@ -4904,7 +5518,7 @@ int effects_add(const char *uri, int instance)
             port->type = TYPE_AUDIO;
 
             /* Allocate memory to audio buffer */
-            audio_buffer = (float *) calloc(g_sample_rate, sizeof(float));
+            audio_buffer = (float *) mod_calloc(g_sample_rate, sizeof(float));
             if (!audio_buffer)
             {
                 fprintf(stderr, "can't get audio buffer\n");
@@ -4925,8 +5539,8 @@ int effects_add(const char *uri, int instance)
                 goto error;
             }
             port->jack_port = jack_port;
-
             audio_ports_count++;
+
             if (lilv_port_is_a(plugin, lilv_port, g_lilv_nodes.input)) input_audio_ports_count++;
             else if (lilv_port_is_a(plugin, lilv_port, g_lilv_nodes.output)) output_audio_ports_count++;
         }
@@ -4983,7 +5597,6 @@ int effects_add(const char *uri, int instance)
 
             /* Set the default value of control */
             float def_value;
-
 
             if (lilv_port_has_property(plugin, lilv_port, g_lilv_nodes.preferMomentaryOff))
             {
@@ -5057,16 +5670,13 @@ int effects_add(const char *uri, int instance)
             port->type = TYPE_CV;
 
             /* Allocate memory to cv buffer */
-            cv_buffer = (float *) calloc(g_sample_rate, sizeof(float));
+            cv_buffer = (float *) mod_calloc(g_sample_rate, sizeof(float));
             if (!cv_buffer)
             {
                 fprintf(stderr, "can't get cv buffer\n");
                 error = ERR_MEMORY_ALLOCATION;
                 goto error;
             }
-
-            if (lilv_port_is_a(plugin, lilv_port, g_lilv_nodes.mod_cvport))
-                port->hints |= HINT_CV_MOD;
 
             port->buffer = cv_buffer;
             port->buffer_count = g_sample_rate;
@@ -5081,6 +5691,9 @@ int effects_add(const char *uri, int instance)
                 error = ERR_JACK_PORT_REGISTER;
                 goto error;
             }
+
+            if (lilv_port_is_a(plugin, lilv_port, g_lilv_nodes.mod_cvport))
+                port->hints |= HINT_CV_MOD;
 
             /* Set the minimum value of control */
             float min_value;
@@ -5117,7 +5730,7 @@ int effects_add(const char *uri, int instance)
                 jack_uuid_t uuid = jack_port_uuid(jack_port);
                 if (!jack_uuid_empty(uuid)) {
                     char str_value[32];
-                    memset(str_value, 0, sizeof(str_value));
+                    mod_memset(str_value, 0, sizeof(str_value));
 
                     snprintf(str_value, 31, "%f", min_value);
                     jack_set_property(jack_client, uuid, LV2_CORE__minimum, str_value, NULL);
@@ -5211,7 +5824,9 @@ int effects_add(const char *uri, int instance)
                     portitemptr->jack_port = jack_port;
 
                     pthread_mutex_lock(&g_raw_midi_port_mutex);
+
                     list_add_tail(&portitemptr->siblings, &g_raw_midi_port_list);
+
                     pthread_mutex_unlock(&g_raw_midi_port_mutex);
                 }
             }
@@ -5220,7 +5835,9 @@ int effects_add(const char *uri, int instance)
 
     // special ports
     {
-        const LilvPort* enabled_port = lilv_plugin_get_port_by_designation(plugin, g_lilv_nodes.input, g_lilv_nodes.enabled);
+        const LilvPort* enabled_port = lilv_plugin_get_port_by_designation(plugin,
+                                                                           g_lilv_nodes.input,
+                                                                           g_lilv_nodes.enabled);
         if (enabled_port)
         {
             effect->enabled_index = lilv_port_get_index(plugin, enabled_port);
@@ -5231,7 +5848,9 @@ int effects_add(const char *uri, int instance)
             effect->enabled_index = -1;
         }
 
-        const LilvPort* freewheel_port = lilv_plugin_get_port_by_designation(plugin, g_lilv_nodes.input, g_lilv_nodes.freeWheeling);
+        const LilvPort* freewheel_port = lilv_plugin_get_port_by_designation(plugin,
+                                                                             g_lilv_nodes.input,
+                                                                             g_lilv_nodes.freeWheeling);
         if (freewheel_port)
         {
             effect->freewheel_index = lilv_port_get_index(plugin, freewheel_port);
@@ -5242,7 +5861,22 @@ int effects_add(const char *uri, int instance)
             effect->freewheel_index = -1;
         }
 
-        const LilvPort* bpb_port = lilv_plugin_get_port_by_designation(plugin, g_lilv_nodes.input, g_lilv_nodes.timeBeatsPerBar);
+        const LilvPort* reset_port = lilv_plugin_get_port_by_designation(plugin,
+                                                                         g_lilv_nodes.input,
+                                                                         g_lilv_nodes.reset);
+        if (reset_port)
+        {
+            effect->reset_index = lilv_port_get_index(plugin, reset_port);
+            *(effect->ports[effect->reset_index]->buffer) = 0.0f;
+        }
+        else
+        {
+            effect->reset_index = -1;
+        }
+
+        const LilvPort* bpb_port = lilv_plugin_get_port_by_designation(plugin,
+                                                                       g_lilv_nodes.input,
+                                                                       g_lilv_nodes.timeBeatsPerBar);
         if (bpb_port)
         {
             effect->bpb_index = lilv_port_get_index(plugin, bpb_port);
@@ -5253,7 +5887,9 @@ int effects_add(const char *uri, int instance)
             effect->bpb_index = -1;
         }
 
-        const LilvPort* bpm_port = lilv_plugin_get_port_by_designation(plugin, g_lilv_nodes.input, g_lilv_nodes.timeBeatsPerMinute);
+        const LilvPort* bpm_port = lilv_plugin_get_port_by_designation(plugin,
+                                                                       g_lilv_nodes.input,
+                                                                       g_lilv_nodes.timeBeatsPerMinute);
         if (bpm_port)
         {
             effect->bpm_index = lilv_port_get_index(plugin, bpm_port);
@@ -5264,7 +5900,9 @@ int effects_add(const char *uri, int instance)
             effect->bpm_index = -1;
         }
 
-        const LilvPort* speed_port = lilv_plugin_get_port_by_designation(plugin, g_lilv_nodes.input, g_lilv_nodes.timeSpeed);
+        const LilvPort* speed_port = lilv_plugin_get_port_by_designation(plugin,
+                                                                         g_lilv_nodes.input,
+                                                                         g_lilv_nodes.timeSpeed);
         if (speed_port)
         {
             effect->speed_index = lilv_port_get_index(plugin, speed_port);
@@ -5281,17 +5919,17 @@ int effects_add(const char *uri, int instance)
     if (audio_ports_count > 0)
     {
         effect->audio_ports_count = audio_ports_count;
-        effect->audio_ports = (port_t **) calloc(audio_ports_count, sizeof(port_t *));
+        effect->audio_ports = (port_t **) mod_calloc(audio_ports_count, sizeof(port_t *));
 
         if (input_audio_ports_count > 0)
         {
             effect->input_audio_ports_count = input_audio_ports_count;
-            effect->input_audio_ports = (port_t **) calloc(input_audio_ports_count, sizeof(port_t *));
+            effect->input_audio_ports = (port_t **) mod_calloc(input_audio_ports_count, sizeof(port_t *));
         }
         if (output_audio_ports_count > 0)
         {
             effect->output_audio_ports_count = output_audio_ports_count;
-            effect->output_audio_ports = (port_t **) calloc(output_audio_ports_count, sizeof(port_t *));
+            effect->output_audio_ports = (port_t **) mod_calloc(output_audio_ports_count, sizeof(port_t *));
         }
     }
 
@@ -5299,17 +5937,17 @@ int effects_add(const char *uri, int instance)
     if (control_ports_count > 0)
     {
         effect->control_ports_count = control_ports_count;
-        effect->control_ports = (port_t **) calloc(control_ports_count, sizeof(port_t *));
+        effect->control_ports = (port_t **) mod_calloc(control_ports_count, sizeof(port_t *));
 
         if (input_control_ports_count > 0)
         {
             effect->input_control_ports_count = input_control_ports_count;
-            effect->input_control_ports = (port_t **) calloc(input_control_ports_count, sizeof(port_t *));
+            effect->input_control_ports = (port_t **) mod_calloc(input_control_ports_count, sizeof(port_t *));
         }
         if (output_control_ports_count > 0)
         {
             effect->output_control_ports_count = output_control_ports_count;
-            effect->output_control_ports = (port_t **) calloc(output_control_ports_count, sizeof(port_t *));
+            effect->output_control_ports = (port_t **) mod_calloc(output_control_ports_count, sizeof(port_t *));
         }
     }
 
@@ -5317,17 +5955,17 @@ int effects_add(const char *uri, int instance)
     if (cv_ports_count > 0)
     {
         effect->cv_ports_count = cv_ports_count;
-        effect->cv_ports = (port_t **) calloc(cv_ports_count, sizeof(port_t *));
+        effect->cv_ports = (port_t **) mod_calloc(cv_ports_count, sizeof(port_t *));
 
         if (input_cv_ports_count > 0)
         {
             effect->input_cv_ports_count = input_cv_ports_count;
-            effect->input_cv_ports = (port_t **) calloc(input_cv_ports_count, sizeof(port_t *));
+            effect->input_cv_ports = (port_t **) mod_calloc(input_cv_ports_count, sizeof(port_t *));
         }
         if (output_cv_ports_count > 0)
         {
             effect->output_cv_ports_count = output_cv_ports_count;
-            effect->output_cv_ports = (port_t **) calloc(output_cv_ports_count, sizeof(port_t *));
+            effect->output_cv_ports = (port_t **) mod_calloc(output_cv_ports_count, sizeof(port_t *));
         }
     }
 
@@ -5335,17 +5973,17 @@ int effects_add(const char *uri, int instance)
     if (event_ports_count > 0)
     {
         effect->event_ports_count = event_ports_count;
-        effect->event_ports = (port_t **) calloc(event_ports_count, sizeof(port_t *));
+        effect->event_ports = (port_t **) mod_calloc(event_ports_count, sizeof(port_t *));
 
         if (input_event_ports_count > 0)
         {
             effect->input_event_ports_count = input_event_ports_count;
-            effect->input_event_ports = (port_t **) calloc(input_event_ports_count, sizeof(port_t *));
+            effect->input_event_ports = (port_t **) mod_calloc(input_event_ports_count, sizeof(port_t *));
         }
         if (output_event_ports_count > 0)
         {
             effect->output_event_ports_count = output_event_ports_count;
-            effect->output_event_ports = (port_t **) calloc(output_event_ports_count, sizeof(port_t *));
+            effect->output_event_ports = (port_t **) mod_calloc(output_event_ports_count, sizeof(port_t *));
         }
     }
 
@@ -5452,7 +6090,7 @@ int effects_add(const char *uri, int instance)
             g_lilv_nodes.patch_readable,
             NULL);
         effect->properties_count = lilv_nodes_size(writable_properties) + lilv_nodes_size(readable_properties);
-        effect->properties = (property_t **) calloc(effect->properties_count, sizeof(property_t *));
+        effect->properties = (property_t **) mod_calloc(effect->properties_count, sizeof(property_t *));
 
         // TODO mix readable and writable
         uint32_t j = 0;
@@ -5478,6 +6116,8 @@ int effects_add(const char *uri, int instance)
         lilv_nodes_free(writable_properties);
         lilv_nodes_free(readable_properties);
     }
+
+    lilv_node_free(plugin_uri);
 
     /* create ring buffer for events from socket/commandline */
     if (control_in_size != 0)
@@ -5524,22 +6164,23 @@ int effects_add(const char *uri, int instance)
 
     pthread_mutexattr_destroy(&mutex_atts);
 
-    lilv_node_free(plugin_uri);
-
     /* Jack callbacks */
     jack_set_thread_init_callback(jack_client, JackThreadInit, effect);
     jack_set_process_callback(jack_client, ProcessPlugin, effect);
     jack_set_buffer_size_callback(jack_client, BufferSize, effect);
     jack_set_freewheel_callback(jack_client, FreeWheelMode, effect);
 
-    lilv_instance_activate(lilv_instance);
-
-    /* Try activate the Jack client */
-    if (jack_activate(jack_client) != 0)
+    if (activate)
     {
-        fprintf(stderr, "can't activate jack_client\n");
-        error = ERR_JACK_CLIENT_ACTIVATION;
-        goto error;
+        lilv_instance_activate(lilv_instance);
+
+        /* Try activate the Jack client */
+        if (jack_activate(jack_client) != 0)
+        {
+            fprintf(stderr, "can't activate jack_client\n");
+            error = ERR_JACK_CLIENT_ACTIVATION;
+            goto error;
+        }
     }
 
     if (raw_midi_port != NULL)
@@ -5570,8 +6211,23 @@ int effects_add(const char *uri, int instance)
 
 error:
     lilv_node_free(plugin_uri);
+
     effects_remove(instance);
     return error;
+}
+
+int effects_add_multi(int activate, int num_effects, int *effects, const char *const *uris)
+{
+    if (num_effects <= 0)
+        return ERR_INVALID_OPERATION;
+
+    if (num_effects == 1)
+        return effects_add(*uris, *effects, activate);
+
+    for (int i = 0; i < num_effects; ++i)
+        effects_add(uris[i], effects[i], activate);
+
+    return SUCCESS;
 }
 
 int effects_preset_load(int effect_id, const char *uri)
@@ -5606,6 +6262,10 @@ int effects_preset_load(int effect_id, const char *uri)
             {
                 *(effect->ports[effect->freewheel_index]->buffer) = 0.0f;
             }
+            if (effect->reset_index >= 0)
+            {
+                *(effect->ports[effect->reset_index]->buffer) = 0.0f;
+            }
             if (effect->bpb_index >= 0)
             {
                 *(effect->ports[effect->bpb_index]->buffer) = g_transport_bpb;
@@ -5639,48 +6299,19 @@ int effects_preset_save(int effect_id, const char *dir, const char *file_name, c
     }
 
     effect = &g_effects[effect_id];
-
-    LV2_State_Make_Path makePath = {
-        effect, MakePluginStatePathDuringLoadSave
-    };
-    const LV2_Feature feature_makePath = { LV2_STATE__makePath, &makePath };
-
-    const LV2_Feature* features[] = {
-        &g_uri_map_feature,
-        &g_urid_map_feature,
-        &g_urid_unmap_feature,
-        &g_options_feature,
-#ifdef __MOD_DEVICES__
-        &g_hmi_wc_feature,
-#endif
-        &g_license_feature,
-        &g_buf_size_features[0],
-        &g_buf_size_features[1],
-        &g_buf_size_features[2],
-        &g_lv2_log_feature,
-        &g_state_freePath_feature,
-        &feature_makePath,
-        effect->features[CTRLPORT_REQUEST_FEATURE],
-        effect->features[WORKER_FEATURE],
-        NULL
-    };
-
     scratch_dir = GetPluginStateDir(effect->instance, g_lv2_scratch_dir);
-    effect->state_dir = dir;
 
     LilvState* const state = lilv_state_new_from_instance(
-        g_effects[effect_id].lilv_plugin,
-        g_effects[effect_id].lilv_instance,
+        effect->lilv_plugin,
+        effect->lilv_instance,
         &g_urid_map,
         scratch_dir,
         dir,
         dir,
         dir,
-        GetPortValueForState, &g_effects[effect_id],
+        GetPortValueForState, effect,
         LV2_STATE_IS_POD|LV2_STATE_IS_PORTABLE,
-        features);
-
-    effect->state_dir = NULL;
+        effect->features);
 
     if (label) {
         lilv_state_set_label(state, label);
@@ -5696,6 +6327,10 @@ int effects_preset_save(int effect_id, const char *dir, const char *file_name, c
 int effects_preset_show(const char *uri, char **state_str)
 {
     LilvNode* preset_uri = lilv_new_uri(g_lv2_data, uri);
+
+    if (! preset_uri) {
+        return ERR_LV2_INVALID_PRESET_URI;
+    }
 
     if (lilv_world_load_resource(g_lv2_data, preset_uri) >= 0)
     {
@@ -5722,79 +6357,27 @@ int effects_preset_show(const char *uri, char **state_str)
     return ERR_LV2_INVALID_PRESET_URI;
 }
 
-int effects_remove(int effect_id)
+// remove addressings, midi learn and other stuff related to a plugin
+static void effects_remove_inner_pre(int effect_id)
 {
-    int start, end;
-    effect_t *effect;
-    char state_filename[g_lv2_scratch_dir != NULL ? PATH_MAX : 1];
-
-    // stop postpone events thread
-    if (g_postevents_running == 1)
-    {
-        g_postevents_running = 0;
-        sem_post(&g_postevents_semaphore);
-        pthread_join(g_postevents_thread, NULL);
-    }
-
-    // disconnect system ports
-    if (effect_id == REMOVE_ALL)
-    {
-        /* Disconnect the system connections */
-        if (g_capture_ports != NULL)
-        {
-            for (int i = 0; g_capture_ports[i]; i++)
-            {
-                const char **capture_connections =
-                    jack_port_get_connections(jack_port_by_name(g_jack_global_client, g_capture_ports[i]));
-
-                if (capture_connections)
-                {
-                    for (int j = 0; capture_connections[j]; j++)
-                    {
-                        if (strstr(capture_connections[j], "system"))
-                            jack_disconnect(g_jack_global_client, g_capture_ports[i], capture_connections[j]);
-                    }
-
-                    jack_free(capture_connections);
-                }
-            }
-        }
-
-        start = 0;
-        end = MAX_PLUGIN_INSTANCES;
-    }
-    else
-    {
-        start = effect_id;
-        end = start + 1;
-    }
-
-    // stop plugins processing
-    for (int j = start; j < end; j++)
-    {
-        if (InstanceExist(j))
-        {
-            effect = &g_effects[j];
-
-            if (jack_deactivate(effect->jack_client) != 0)
-                return ERR_JACK_CLIENT_DEACTIVATION;
-        }
-    }
-
-    // remove addressings, midi learn and other stuff related to plugins
     if (effect_id == REMOVE_ALL)
     {
         pthread_mutex_lock(&g_midi_learning_mutex);
         g_midi_learning = NULL;
         pthread_mutex_unlock(&g_midi_learning_mutex);
 
-        for (int j = 0; j < MAX_MIDI_CC_ASSIGN; j++)
+        for (int j = MAX_MIDI_CC_ASSIGN, unused = ASSIGNMENT_NULL; --j >= 0;)
         {
+            if (g_midi_cc_list[j].effect_id >= MAX_PLUGIN_INSTANCES && g_midi_cc_list[j].effect_id < MAX_INSTANCES)
+            {
+                unused = ASSIGNMENT_UNUSED;
+                continue;
+            }
             g_midi_cc_list[j].channel = -1;
             g_midi_cc_list[j].controller = 0;
             g_midi_cc_list[j].minimum = 0.0f;
             g_midi_cc_list[j].maximum = 1.0f;
-            g_midi_cc_list[j].effect_id = ASSIGNMENT_NULL;
+            g_midi_cc_list[j].effect_id = unused;
             g_midi_cc_list[j].symbol = NULL;
             g_midi_cc_list[j].port = NULL;
         }
@@ -5813,16 +6396,16 @@ int effects_remove(int effect_id)
                     if (assignment->effect_id == ASSIGNMENT_UNUSED)
                         continue;
 
-                    cc_assignment_key_t key;
-                    key.device_id = assignment->device_id;
+                    cc_assignment_key_t key = {0};
                     key.id = assignment->assignment_id;
+                    key.device_id = assignment->device_id;
                     key.pair_id = assignment->assignment_pair_id;
                     cc_client_unassignment(g_cc_client, &key);
                 }
             }
         }
 
-        memset(&g_assignments_list, 0, sizeof(g_assignments_list));
+        mod_memset(&g_assignments_list, 0, sizeof(g_assignments_list));
 
         for (int i = 0; i < CC_MAX_DEVICES; i++)
         {
@@ -5834,7 +6417,7 @@ int effects_remove(int effect_id)
         }
 #endif
 
-#ifdef __MOD_DEVICES__
+#ifdef MOD_HMI_CONTROL_ENABLED
         for (int i = 0; i < MAX_HMI_ADDRESSINGS; i++)
             g_hmi_addressings[i].actuator_id = -1;
 
@@ -5844,10 +6427,10 @@ int effects_remove(int effect_id)
             sys_serial_write(&g_hmi_data->server, sys_serial_event_type_special_req, 0, 0, "pages");
             pthread_mutex_unlock(&g_hmi_mutex);
         }
+#endif
 
         // this resets volume back 0dB if needed
         // monitor_client_setup_volume(0.0f);
-#endif
 
         // reset all events
         struct list_head queue, *it, *it2;
@@ -5937,136 +6520,328 @@ int effects_remove(int effect_id)
 
                 if (g_cc_client)
                 {
-                    cc_assignment_key_t key;
-                    key.device_id = assignment->device_id;
+                    cc_assignment_key_t key = {0};
                     key.id = assignment->assignment_id;
+                    key.device_id = assignment->device_id;
                     key.pair_id = assignment->assignment_pair_id;
                     cc_client_unassignment(g_cc_client, &key);
                 }
 
-                memset(assignment, 0, sizeof(assignment_t));
+                mod_memset(assignment, 0, sizeof(assignment_t));
                 assignment->effect_id = ASSIGNMENT_UNUSED;
                 assignment->assignment_pair_id = -1;
             }
         }
 #endif
+    }
+}
 
-        // flush events for all effects except this one
-        RunPostPonedEvents(effect_id);
+// cleanup the plugin (inner loop)
+static void effects_remove_inner_loop(int effect_id)
+{
+    effect_t *effect = &g_effects[effect_id];
+
+#ifdef WITH_EXTERNAL_UI_SUPPORT
+    if (effect->ui_libhandle != NULL)
+    {
+        if (effect->ui_desc != NULL && effect->ui_handle != NULL && effect->ui_desc->cleanup != NULL)
+            effect->ui_desc->cleanup(effect->ui_handle);
+
+        dlclose(effect->ui_libhandle);
+    }
+#endif
+
+    FreeFeatures(effect);
+
+    if (effect->event_ports)
+    {
+        for (uint32_t i = 0; i < effect->event_ports_count; i++)
+        {
+            lv2_evbuf_free(effect->event_ports[i]->evbuf);
+        }
     }
 
-    // now finally cleanup the plugin(s)
+    if (effect->ports)
+    {
+        for (uint32_t i = 0; i < effect->ports_count; i++)
+        {
+            if (effect->ports[i])
+            {
+#ifdef MOD_HMI_CONTROL_ENABLED
+                if (effect->ports[i]->hmi_addressing != NULL)
+                {
+                    if (g_hmi_data != NULL)
+                    {
+                        char msg[24];
+                        snprintf(msg, sizeof(msg), "%i", effect->ports[i]->hmi_addressing->actuator_id);
+                        msg[sizeof(msg)-1] = '\0';
+
+                        pthread_mutex_lock(&g_hmi_mutex);
+                        sys_serial_write(&g_hmi_data->server,
+                                          sys_serial_event_type_unassign,
+                                          effect->ports[i]->hmi_addressing->page,
+                                          effect->ports[i]->hmi_addressing->subpage, msg);
+                        pthread_mutex_unlock(&g_hmi_mutex);
+                    }
+
+                    effect->ports[i]->hmi_addressing->actuator_id = -1;
+                }
+#endif
+
+                // TODO destroy port mutexes
+                free(effect->ports[i]->buffer);
+
+                lilv_scale_points_free(effect->ports[i]->scale_points);
+
+                free(effect->ports[i]);
+            }
+        }
+        free(effect->ports);
+    }
+
+    if (effect->properties)
+    {
+        for (uint32_t i = 0; i < effect->properties_count; i++)
+        {
+            if (effect->properties[i])
+            {
+                lilv_node_free(effect->properties[i]->uri);
+                lilv_node_free(effect->properties[i]->type);
+            }
+        }
+
+        for (uint32_t i = 0; i < effect->properties_count; i++)
+            free(effect->properties[i]);
+        free(effect->properties);
+    }
+
+    if (effect->lilv_instance)
+    {
+        if (effect->activated)
+            lilv_instance_deactivate(effect->lilv_instance);
+
+        lilv_instance_free(effect->lilv_instance);
+    }
+
+    if (effect->jack_client)
+        jack_client_close(effect->jack_client);
+
+    free(effect->audio_ports);
+    free(effect->input_audio_ports);
+    free(effect->output_audio_ports);
+
+    free(effect->control_ports);
+    free(effect->input_control_ports);
+    free(effect->output_control_ports);
+
+    free(effect->cv_ports);
+    free(effect->input_cv_ports);
+    free(effect->output_cv_ports);
+
+    free(effect->event_ports);
+    free(effect->input_event_ports);
+    free(effect->output_event_ports);
+
+    if (effect->events_in_buffer)
+        jack_ringbuffer_free(effect->events_in_buffer);
+    if (effect->events_in_buffer_helper)
+        free(effect->events_in_buffer_helper);
+    if (effect->events_out_buffer)
+        jack_ringbuffer_free(effect->events_out_buffer);
+
+    if (effect->presets)
+    {
+        for (uint32_t i = 0; i < effect->presets_count; i++)
+            lilv_free(effect->presets[i]->uri);
+
+        for (uint32_t i = 0; i < effect->presets_count; i++)
+            free(effect->presets[i]);
+        free(effect->presets);
+    }
+
+    if (effect->hints & HINT_HAS_STATE)
+    {
+        if (g_lv2_scratch_dir != NULL)
+        {
+            // recursively delete state folder
+            char state_filename[g_lv2_scratch_dir != NULL ? PATH_MAX : 1];
+            memset(state_filename, 0, sizeof(state_filename));
+            snprintf(state_filename, PATH_MAX-1, "%s/effect-%d",
+                     g_lv2_scratch_dir, effect->instance);
+            RecursivelyRemovePluginPath(state_filename);
+        }
+
+        if (effect->hints & HINT_STATE_UNSAFE)
+            pthread_mutex_destroy(&effect->state_restore_mutex);
+    }
+
+    InstanceDelete(effect_id);
+}
+
+int effects_remove(int effect_id)
+{
+    int start, end;
+    effect_t *effect;
+
+    // stop postpone events thread
+    if (g_postevents_running == 1)
+    {
+        g_postevents_running = 0;
+        sem_post(&g_postevents_semaphore);
+        zix_thread_join(g_postevents_thread, NULL);
+    }
+
+    // disconnect system ports
+    if (effect_id == REMOVE_ALL)
+    {
+        /* Disconnect the system connections */
+        if (g_capture_ports != NULL)
+        {
+            for (int i = 0; g_capture_ports[i]; i++)
+            {
+                jack_port_t *port = jack_port_by_name(g_jack_global_client, g_capture_ports[i]);
+                if (! port)
+                    continue;
+
+                const char **capture_connections = jack_port_get_connections(port);
+                if (capture_connections)
+                {
+                    for (int j = 0; capture_connections[j]; j++)
+                    {
+                        if (strstr(capture_connections[j], "system"))
+                            jack_disconnect(g_jack_global_client, g_capture_ports[i], capture_connections[j]);
+                    }
+
+                    jack_free(capture_connections);
+                }
+            }
+        }
+
+        start = 0;
+        end = MAX_PLUGIN_INSTANCES;
+
+        // clear all sync scheduled params if removing all plugins
+        pthread_mutex_lock(&g_sync_scheduled_params_mutex);
+        g_sync_scheduled_param_count = 0;
+        pthread_mutex_unlock(&g_sync_scheduled_params_mutex);
+    }
+    else
+    {
+        start = effect_id;
+        end = start + 1;
+
+        // trigger sync scheduled params now for no dangling pointers
+        effect_sync_scheduled_params(false);
+    }
+
+    // stop plugins processing
     for (int j = start; j < end; j++)
     {
         if (InstanceExist(j))
         {
             effect = &g_effects[j];
 
-            FreeFeatures(effect);
-
-            if (effect->event_ports)
-            {
-                for (uint32_t i = 0; i < effect->event_ports_count; i++)
-                {
-                    lv2_evbuf_free(effect->event_ports[i]->evbuf);
-                }
-            }
-
-            if (effect->ports)
-            {
-                for (uint32_t i = 0; i < effect->ports_count; i++)
-                {
-                    if (effect->ports[i])
-                    {
-#ifdef __MOD_DEVICES__
-                        if (effect->ports[i]->hmi_addressing != NULL)
-                        {
-                            if (g_hmi_data != NULL)
-                            {
-                                char msg[24];
-                                snprintf(msg, sizeof(msg), "%i", effect->ports[i]->hmi_addressing->actuator_id);
-                                msg[sizeof(msg)-1] = '\0';
-
-                                pthread_mutex_lock(&g_hmi_mutex);
-                                sys_serial_write(&g_hmi_data->server,
-                                                 sys_serial_event_type_unassign,
-                                                 effect->ports[i]->hmi_addressing->page,
-                                                 effect->ports[i]->hmi_addressing->subpage, msg);
-                                pthread_mutex_unlock(&g_hmi_mutex);
-                            }
-
-                            effect->ports[i]->hmi_addressing->actuator_id = -1;
-                        }
-#endif
-
-                        // TODO destroy port mutexes
-                        free(effect->ports[i]->buffer);
-                        lilv_scale_points_free(effect->ports[i]->scale_points);
-                        free(effect->ports[i]);
-                    }
-                }
-                free(effect->ports);
-            }
-
-            if (effect->properties)
-            {
-                for (uint32_t i = 0; i < effect->properties_count; i++)
-                {
-                    if (effect->properties[i])
-                    {
-                        lilv_node_free(effect->properties[i]->uri);
-                        lilv_node_free(effect->properties[i]->type);
-                        free(effect->properties[i]);
-                    }
-                }
-                free(effect->properties);
-            }
-
-            if (effect->lilv_instance)
-                lilv_instance_deactivate(effect->lilv_instance);
-            lilv_instance_free(effect->lilv_instance);
-
-            if (effect->jack_client)
-                jack_client_close(effect->jack_client);
-
-            free(effect->audio_ports);
-            free(effect->input_audio_ports);
-            free(effect->output_audio_ports);
-            free(effect->control_ports);
-            if (effect->events_in_buffer)
-                jack_ringbuffer_free(effect->events_in_buffer);
-            if (effect->events_in_buffer_helper)
-                free(effect->events_in_buffer_helper);
-            if (effect->events_out_buffer)
-                jack_ringbuffer_free(effect->events_out_buffer);
-
-            if (effect->presets)
-            {
-                for (uint32_t i = 0; i < effect->presets_count; i++)
-                {
-                    lilv_free(effect->presets[i]->uri);
-                    free(effect->presets[i]);
-                }
-                free(effect->presets);
-            }
-
-            if (effect->hints & HINT_HAS_STATE)
-            {
-                if (g_lv2_scratch_dir != NULL)
-                {
-                    // recursively delete state folder
-                    bzero(state_filename, sizeof(state_filename));
-                    snprintf(state_filename, PATH_MAX-1, "%s/effect-%d",
-                             g_lv2_scratch_dir, effect->instance);
-                    RecursivelyRemovePluginPath(state_filename);
-                }
-
-                if (effect->hints & HINT_STATE_UNSAFE)
-                    pthread_mutex_destroy(&effect->state_restore_mutex);
-            }
-
-            InstanceDelete(j);
+            if (jack_deactivate(effect->jack_client) != 0)
+                return ERR_JACK_CLIENT_DEACTIVATION;
         }
+    }
+
+    // remove addressings, midi learn and other stuff related to plugins
+    effects_remove_inner_pre(effect_id);
+
+    // flush events for all effects except this one
+    if (effect_id != REMOVE_ALL)
+        RunPostPonedEvents(effect_id);
+
+    // now finally cleanup the plugin(s)
+    for (int j = start; j < end; j++)
+    {
+        if (InstanceExist(j))
+            effects_remove_inner_loop(j);
+    }
+
+    // clear param_set cache
+    effects_set_parameter(-1, NULL, 0.f);
+
+    // start thread again
+    if (g_postevents_running == 0)
+    {
+        if (g_verbose_debug)
+        {
+            puts("DEBUG: effects_remove restarted RunPostPonedEvents thread");
+            fflush(stdout);
+        }
+
+        g_postevents_running = 1;
+        zix_thread_create(&g_postevents_thread, 0, PostPonedEventsThread, NULL);
+    }
+
+    return SUCCESS;
+}
+
+int effects_remove_multi(int num_effects, int *effects)
+{
+    if (num_effects <= 0)
+        return ERR_INVALID_OPERATION;
+
+    if (num_effects == 1)
+        return effects_remove(*effects);
+
+    int num_threads = 0;
+    ZixThread *threads = malloc(sizeof(ZixThread) * num_effects);
+    effect_t *effect;
+
+    if (!threads)
+        return ERR_MEMORY_ALLOCATION;
+
+    // stop postpone events thread
+    if (g_postevents_running == 1)
+    {
+        g_postevents_running = 0;
+        sem_post(&g_postevents_semaphore);
+        zix_thread_join(g_postevents_thread, NULL);
+    }
+
+    // stop plugins processing
+    for (int i = 0, effect_id; i < num_effects; ++i)
+    {
+        effect_id = effects[i];
+        effect = &g_effects[effect_id];
+
+        if (effect->jack_client == NULL)
+            continue;
+
+        if (effect->activated)
+        {
+            if (zix_thread_create(&threads[num_threads], sizeof(void*), effects_deactivate_thread, effect->jack_client) == 0)
+                ++num_threads;
+            else
+                jack_deactivate(effect->jack_client);
+        }
+    }
+
+    for (int i = 0; i < num_threads; ++i)
+        zix_thread_join(threads[i], NULL);
+
+    // remove addressings, midi learn and other stuff related to plugins
+    for (int i = 0, effect_id; i < num_effects; ++i)
+    {
+        effect_id = effects[i];
+        if (InstanceExist(effect_id))
+            effects_remove_inner_pre(effect_id);
+    }
+
+    // flush events for all effects
+    RunPostPonedEvents(-3);
+
+    // cleanup the plugins
+    for (int i = 0, effect_id; i < num_effects; ++i)
+    {
+        effect_id = effects[i];
+        if (!InstanceExist(effect_id))
+            continue;
+
+        effects_remove_inner_loop(effect_id);
     }
 
     // start thread again
@@ -6079,15 +6854,162 @@ int effects_remove(int effect_id)
         }
 
         g_postevents_running = 1;
-        pthread_create(&g_postevents_thread, NULL, PostPonedEventsThread, NULL);
+        zix_thread_create(&g_postevents_thread, 0, PostPonedEventsThread, NULL);
+    }
+
+    free(threads);
+
+    return SUCCESS;
+}
+
+int effects_activate(int effect_id, int value)
+{
+    if (!InstanceExist(effect_id))
+    {
+        return ERR_INSTANCE_NON_EXISTS;
+    }
+
+    effect_t *effect = &g_effects[effect_id];
+
+    if (value)
+    {
+        if (! effect->activated)
+        {
+            effect->activated = true;
+            lilv_instance_activate(effect->lilv_instance);
+
+            if (jack_activate(effect->jack_client) != 0)
+            {
+                fprintf(stderr, "can't activate jack_client\n");
+                return ERR_JACK_CLIENT_ACTIVATION;
+            }
+        }
+    }
+    else
+    {
+        if (effect->activated)
+        {
+            effect->activated = false;
+
+            if (jack_deactivate(effect->jack_client) != 0)
+            {
+                fprintf(stderr, "can't deactivate jack_client\n");
+                return ERR_JACK_CLIENT_DEACTIVATION;
+            }
+
+            lilv_instance_deactivate(effect->lilv_instance);
+        }
     }
 
     return SUCCESS;
 }
 
-int effects_connect(const char *portA, const char *portB)
+static void* effects_activate_thread(void* arg)
+{
+    jack_client_t *jack_client = arg;
+
+    if (jack_activate(jack_client) != 0)
+        fprintf(stderr, "can't activate jack_client\n");
+
+    return NULL;
+}
+
+static void* effects_deactivate_thread(void* arg)
+{
+    jack_client_t *jack_client = arg;
+
+    if (jack_deactivate(jack_client) != 0)
+        fprintf(stderr, "can't deactivate jack_client\n");
+
+    return NULL;
+}
+
+int effects_activate_multi(int value, int num_effects, int *effects)
+{
+    if (num_effects <= 0)
+        return ERR_INVALID_OPERATION;
+
+    if (num_effects == 1)
+        return effects_activate(*effects, value);
+
+    int num_threads = 0;
+    ZixThread *threads = malloc(sizeof(ZixThread) * num_effects);
+
+    if (!threads)
+        return ERR_MEMORY_ALLOCATION;
+
+    effect_t *effect;
+
+    // create threads to activate all clients
+    // reduces time spent waiting for jack operations to complete, triggering in parallel
+    for (int i = 0, effect_id; i < num_effects; ++i)
+    {
+        effect_id = effects[i];
+        effect = &g_effects[effect_id];
+
+        if (effect->jack_client == NULL)
+            continue;
+
+        if (value)
+        {
+            if (! effect->activated)
+            {
+                effect->activated = true;
+                lilv_instance_activate(effect->lilv_instance);
+
+                if (zix_thread_create(&threads[num_threads], sizeof(void*), effects_activate_thread, effect->jack_client) == 0)
+                    ++num_threads;
+                else
+                    jack_activate(effect->jack_client);
+            }
+        }
+        else
+        {
+            if (effect->activated)
+            {
+                if (zix_thread_create(&threads[num_threads], sizeof(void*), effects_deactivate_thread, effect->jack_client) == 0)
+                    ++num_threads;
+                else
+                    jack_deactivate(effect->jack_client);
+            }
+        }
+    }
+
+    // wait for all threads to be done
+    for (int i = 0; i < num_threads; ++i)
+        zix_thread_join(threads[i], NULL);
+
+    free(threads);
+
+    // if deactivating, do the last lv2 deactivate step now
+    if (! value)
+    {
+        for (int i = 0, effect_id; i < num_effects; ++i)
+        {
+            effect_id = effects[i];
+            effect = &g_effects[effect_id];
+
+            if (! effect->activated || effect->jack_client == NULL)
+                continue;
+
+            effect->activated = false;
+            lilv_instance_deactivate(effect->lilv_instance);
+        }
+    }
+
+    return SUCCESS;
+}
+
+int effects_connect(const char *portA, const char *portB, int check)
 {
     int ret;
+
+    if (check != 0)
+    {
+        if (jack_port_by_name(g_jack_global_client, portA) == NULL ||
+            jack_port_by_name(g_jack_global_client, portB) == NULL)
+            return ERR_JACK_PORT_CONNECTION;
+    }
 
     ret = jack_connect(g_jack_global_client, portA, portB);
     if (ret != 0 && ret != EEXIST) ret = jack_connect(g_jack_global_client, portB, portA);
@@ -6098,15 +7020,75 @@ int effects_connect(const char *portA, const char *portB)
     return ret;
 }
 
-int effects_disconnect(const char *portA, const char *portB)
+int effects_connect_matching(const char *matching, const char *port)
+{
+    const jack_port_t *jport = jack_port_by_name(g_jack_global_client, matching);
+    if (!jport)
+        return ERR_JACK_PORT_CONNECTION;
+
+    const char **jports = jack_port_get_connections(jport);
+    if (jports)
+    {
+        for (int i = 0; jports[i]; ++i)
+            jack_connect(g_jack_global_client, jports[i], port);
+        jack_free(jports);
+    }
+
+    return SUCCESS;
+}
+
+int effects_disconnect(const char *portA, const char *portB, int check)
 {
     int ret;
+
+    if (check != 0)
+    {
+        const jack_port_t *jportA = jack_port_by_name(g_jack_global_client, portA);
+        const jack_port_t *jportB = jack_port_by_name(g_jack_global_client, portB);
+        if (jportA == NULL || jportB == NULL)
+            return ERR_JACK_PORT_CONNECTION;
+
+        if (jack_port_connected(jportA) == 0 || jack_port_connected(jportB) == 0)
+            return ERR_JACK_PORT_CONNECTION;
+    }
 
     ret = jack_disconnect(g_jack_global_client, portA, portB);
     if (ret != 0) ret = jack_disconnect(g_jack_global_client, portB, portA);
     if (ret != 0) return ERR_JACK_PORT_DISCONNECTION;
 
     return ret;
+}
+
+int effects_disconnect_all(const char *port)
+{
+    int ret;
+
+    ret = jack_port_disconnect(g_jack_global_client, jack_port_by_name(g_jack_global_client, port));
+    if (ret != 0) return ERR_JACK_PORT_DISCONNECTION;
+
+    return ret;
+}
+
+void effects_send_midi_feedback(int effect_id, const char *control_symbol)
+{
+    for (int j = 0; j < MAX_MIDI_CC_ASSIGN; j++)
+    {
+        if (g_midi_cc_list[j].effect_id == ASSIGNMENT_NULL)
+            break;
+        if (g_midi_cc_list[j].effect_id == ASSIGNMENT_UNUSED)
+            continue;
+        if (g_midi_cc_list[j].effect_id  == effect_id)
+        { 
+            // avoid call to strcmp and compare strings ourselves
+            bool bEqual = false;
+            for(const char *s1 = control_symbol, *s2 = g_midi_cc_list[j].symbol; (bEqual = *s1 == *s2) && *s1; s1++, s2++)
+                /* empty loop*/;
+
+            if(bEqual)
+                SetMidiOutValue(&(g_midi_cc_list[j]));
+        }
+        
+    }
 }
 
 int effects_set_parameter(int effect_id, const char *control_symbol, float value)
@@ -6116,6 +7098,9 @@ int effects_set_parameter(int effect_id, const char *control_symbol, float value
     static int last_effect_id = -1;
     static const char *last_symbol = NULL;
     static float *last_buffer, *last_prev, last_min, last_max;
+#ifdef WITH_EXTERNAL_UI_SUPPORT
+    static enum PortHints *last_hints;
+#endif
 
     if (InstanceExist(effect_id))
     {
@@ -6130,7 +7115,14 @@ int effects_set_parameter(int effect_id, const char *control_symbol, float value
                     value = last_max;
 
                 *last_buffer = *last_prev = value;
-                return SUCCESS;
+#ifdef WITH_EXTERNAL_UI_SUPPORT
+                *last_hints |= HINT_SHOULD_UPDATE;
+#endif
+            // if midi feedback is enabled find the correct CC and set it to be output
+            if(g_enable_midi_feedback)
+                effects_send_midi_feedback(effect_id, control_symbol);
+
+            return SUCCESS;
             }
         }
 
@@ -6138,6 +7130,7 @@ int effects_set_parameter(int effect_id, const char *control_symbol, float value
         if (port)
         {
             // stores the data of the current control
+            last_effect_id = effect_id;
             last_min = port->min_value;
             last_max = port->max_value;
             last_buffer = port->buffer;
@@ -6150,35 +7143,85 @@ int effects_set_parameter(int effect_id, const char *control_symbol, float value
                 value = last_max;
 
             *last_prev = *last_buffer = value;
+
             // if midi feedback is enabled find the correct CC and set it to be output
             if(g_enable_midi_feedback)
-            {
-                for (int j = 0; j < MAX_MIDI_CC_ASSIGN; j++)
-                {
-                    if (g_midi_cc_list[j].effect_id == ASSIGNMENT_NULL)
-                        break;
-                    if (g_midi_cc_list[j].effect_id == ASSIGNMENT_UNUSED)
-                        continue;
-                    if (g_midi_cc_list[j].effect_id  == effect_id)
-                    { 
-                        // avoid call to strcmp and compare strings ourselves
-                        bool bEqual = false;
-                        for(const char *s1 = control_symbol, *s2 = g_midi_cc_list[j].symbol; (bEqual = *s1 == *s2) && *s1; s1++, s2++)
-                            /* empty loop*/;
+                effects_send_midi_feedback(effect_id, control_symbol);
 
-                        if(bEqual)
-                            SetMidiOutValue(&(g_midi_cc_list[j]));
-                    }
-                    
-                }
-            }
+#ifdef WITH_EXTERNAL_UI_SUPPORT
+            last_hints = &port->hints;
+            port->hints |= HINT_SHOULD_UPDATE;
+#endif
             return SUCCESS;
         }
 
+        last_effect_id = -1;
         return ERR_LV2_INVALID_PARAM_SYMBOL;
     }
 
+    last_effect_id = -1;
     return ERR_INSTANCE_NON_EXISTS;
+}
+
+int effects_set_parameter_multi(const char *control_symbol, float value, int num_effects, int *effects)
+{
+    if (num_effects <= 0)
+        return ERR_INVALID_OPERATION;
+
+    if (num_effects == 1)
+        return effects_set_parameter(*effects, control_symbol, value);
+
+    port_t **ports = malloc(sizeof(port_t*) * num_effects);
+
+    if (ports == NULL)
+        return ERR_MEMORY_ALLOCATION;
+
+    int num_ports = 0;
+    for (int i = 0, effect_id; i < num_effects; i++)
+    {
+        effect_id = effects[i];
+        if (InstanceExist(effect_id))
+        {
+            if ((ports[num_ports] = FindEffectInputPortBySymbol(&(g_effects[effect_id]), control_symbol)))
+                ++num_ports;
+        }
+    }
+
+    // the critical loop, must be as fast and small as possible
+    bool scheduled = true;
+    pthread_mutex_lock(&g_sync_scheduled_params_mutex);
+    if (g_sync_scheduled_param_count + num_ports <= MAX_SYNC_SCHEDULED_PARAMS)
+    {
+        int p = g_sync_scheduled_param_count;
+        for (int i = 0; i < num_ports; i++, p++)
+        {
+            g_sync_scheduled_params[p].port = ports[i];
+            g_sync_scheduled_params[p].value = value;
+        }
+        g_sync_scheduled_param_count = p;
+    }
+    else
+    {
+        scheduled = false;
+    }
+    pthread_mutex_unlock(&g_sync_scheduled_params_mutex);
+
+    if (! scheduled)
+    {
+        // no space to schedule events, trigger param changes now
+        for (int i = 0; i < num_ports; i++)
+        {
+            port_t *port = ports[i];
+            port->prev_value = *port->buffer = value;
+#ifdef WITH_EXTERNAL_UI_SUPPORT
+            port->hints |= HINT_SHOULD_UPDATE;
+#endif
+        }
+    }
+
+    free(ports);
+
+    return SUCCESS;
 }
 
 int effects_get_parameter(int effect_id, const char *control_symbol, float *value)
@@ -6190,7 +7233,7 @@ int effects_get_parameter(int effect_id, const char *control_symbol, float *valu
         port = FindEffectInputPortBySymbol(&(g_effects[effect_id]), control_symbol);
         if (port)
         {
-           (*value) = *(port->buffer);
+           *value = *(port->buffer);
            return SUCCESS;
         }
 
@@ -6198,6 +7241,142 @@ int effects_get_parameter(int effect_id, const char *control_symbol, float *valu
     }
 
     return ERR_INSTANCE_NON_EXISTS;
+}
+
+int effects_flush_parameters(int effect_id, int reset, int param_count, const flushed_param_t *params)
+{
+    if (!InstanceExist(effect_id))
+        return ERR_INSTANCE_NON_EXISTS;
+
+    effect_t *effect = &(g_effects[effect_id]);
+    port_t *port;
+
+    if (effect->reset_index >= 0 && reset != 0)
+    {
+        port = effect->ports[effect->reset_index];
+        port->prev_value = *(port->buffer) = reset;
+    }
+
+    for (int i = 0; i < param_count; i++)
+    {
+        port = FindEffectInputPortBySymbol(effect, params[i].symbol);
+        if (port)
+        {
+            port->prev_value = *(port->buffer) = params[i].value;
+#ifdef WITH_EXTERNAL_UI_SUPPORT
+            port->hints |= HINT_SHOULD_UPDATE;
+#endif
+        }
+    }
+
+    // reset a 2nd time in case plugin was processing while we changed parameters
+    if (effect->reset_index >= 0 && reset != 0)
+    {
+        port = effect->ports[effect->reset_index];
+        port->prev_value = *(port->buffer) = reset;
+    }
+
+    return SUCCESS;
+}
+
+int effects_flush_parameters_multi(int reset, int param_count, const flushed_param_t *params, int num_effects, int *effects)
+{
+    if (num_effects <= 0)
+        return ERR_INVALID_OPERATION;
+
+    if (num_effects == 1)
+        return effects_flush_parameters(*effects, reset, param_count, params);
+
+    cached_effect_flush_t *cached_effect;
+    effect_t *effect;
+    port_t *port;
+
+    int num_cached_effects = 0;
+    cached_effect_flush_t *cached_effects = malloc(sizeof(cached_effect_flush_t) * num_effects);
+
+    if (cached_effects == NULL)
+        return ERR_MEMORY_ALLOCATION;
+
+    for (int i = 0, effect_id; i < num_effects; i++)
+    {
+        effect_id = effects[i];
+        if (InstanceExist(effect_id))
+        {
+            effect = &(g_effects[effect_id]);
+
+            cached_effect = &cached_effects[num_cached_effects++];
+            cached_effect->effect = effect;
+            cached_effect->ports = malloc(sizeof(port_t*) * param_count);
+            cached_effect->num_ports = 0;
+
+            for (int j = 0; j < param_count; j++)
+            {
+                if ((cached_effect->ports[cached_effect->num_ports] = FindEffectInputPortBySymbol(effect, params[j].symbol)))
+                    ++cached_effect->num_ports;
+            }
+        }
+    }
+
+    // the critical loop, must be as fast and small as possible
+    bool scheduled = true;
+    const int resetb = reset != 0 ? 1 : 0;
+    pthread_mutex_lock(&g_sync_scheduled_params_mutex);
+    if (g_sync_scheduled_param_count + (param_count + resetb) * num_cached_effects <= MAX_SYNC_SCHEDULED_PARAMS)
+    {
+        int p = g_sync_scheduled_param_count;
+        for (int i = 0; i < num_cached_effects; i++)
+        {
+            cached_effect = &cached_effects[i];
+            effect = cached_effect->effect;
+            for (int j = 0; j < cached_effect->num_ports; j++, p++)
+            {
+                g_sync_scheduled_params[p].port = cached_effect->ports[j];
+                g_sync_scheduled_params[p].value = params[j].value;
+            }
+            if (effect->reset_index >= 0 && reset != 0)
+            {
+                g_sync_scheduled_params[p].port = effect->ports[effect->reset_index];
+                g_sync_scheduled_params[p].value = reset;
+                ++p;
+            }
+        }
+        g_sync_scheduled_param_count = p;
+    }
+    else
+    {
+        scheduled = false;
+    }
+    pthread_mutex_unlock(&g_sync_scheduled_params_mutex);
+
+    if (! scheduled)
+    {
+        // no space to schedule events, trigger param changes now
+        for (int i = 0; i < num_cached_effects; i++)
+        {
+            cached_effect = &cached_effects[i];
+            effect = cached_effect->effect;
+            for (int j = 0; j < cached_effect->num_ports; j++)
+            {
+                port = cached_effect->ports[j];
+                port->prev_value = *(port->buffer) = params[j].value;
+#ifdef WITH_EXTERNAL_UI_SUPPORT
+                port->hints |= HINT_SHOULD_UPDATE;
+#endif
+            }
+            if (effect->reset_index >= 0 && reset != 0)
+            {
+                port = effect->ports[effect->reset_index];
+                port->prev_value = *(port->buffer) = reset;
+            }
+        }
+    }
+
+    for (int i = 0; i < num_cached_effects; i++)
+        free(cached_effects[i].ports);
+
+    free(cached_effects);
+
+    return SUCCESS;
 }
 
 static inline
@@ -6590,7 +7769,7 @@ int effects_monitor_parameter(int effect_id, const char *control_symbol, const c
     return SUCCESS;
 }
 
-int effects_monitor_output_parameter(int effect_id, const char *control_symbol_or_uri)
+int effects_monitor_output_parameter(int effect_id, const char *control_symbol_or_uri, int enable)
 {
     port_t *port;
 
@@ -6602,12 +7781,48 @@ int effects_monitor_output_parameter(int effect_id, const char *control_symbol_o
 
     if (port != NULL)
     {
+        if (enable == 0)
+        {
+            // check if not monitored
+            if ((port->hints & HINT_MONITORED) == 0)
+                return SUCCESS;
+
+            // remove monitored flag
+            port->hints &= ~HINT_MONITORED;
+
+            // stop postpone events thread
+            if (g_postevents_running == 1)
+            {
+                g_postevents_running = 0;
+                sem_post(&g_postevents_semaphore);
+                zix_thread_join(g_postevents_thread, NULL);
+            }
+
+            // flush events for all effects except this one
+            RunPostPonedEvents(effect_id);
+
+            // start thread again
+            if (g_postevents_running == 0)
+            {
+                if (g_verbose_debug)
+                {
+                    puts("DEBUG: effects_monitor_output_parameter restarted RunPostPonedEvents thread");
+                    fflush(stdout);
+                }
+
+                g_postevents_running = 1;
+                zix_thread_create(&g_postevents_thread, 0, PostPonedEventsThread, NULL);
+            }
+
+            return SUCCESS;
+        }
+
         // check if already monitored
         if (port->hints & HINT_MONITORED)
             return SUCCESS;
 
         // set prev_value
-        port->prev_value = (*port->buffer);
+        port->prev_value = *(port->buffer);
         port->hints |= HINT_MONITORED;
 
         // simulate an output monitor event here, to report current value
@@ -6634,7 +7849,7 @@ int effects_monitor_output_parameter(int effect_id, const char *control_symbol_o
         if (property == NULL)
             return ERR_LV2_INVALID_PARAM_SYMBOL;
 
-        property->monitored = true;
+        property->monitored = enable != 0;
     }
 
     // activate output monitor
@@ -6655,7 +7870,37 @@ int effects_bypass(int effect_id, int value)
 
     if (effect->enabled_index >= 0)
     {
-        *(effect->ports[effect->enabled_index]->buffer) = value ? 0.0f : 1.0f;
+        port_t *port = effect->ports[effect->enabled_index];
+        port->prev_value = *port->buffer = value ? 0.0f : 1.0f;
+    }
+
+    return SUCCESS;
+}
+
+int effects_bypass_multi(int value, int num_effects, int *effects)
+{
+    if (num_effects <= 0)
+        return ERR_INVALID_OPERATION;
+
+    effect_t *effect;
+    port_t *port;
+    float bypass_value = value ? 1.0f : 0.0f;
+    float enabled_value = value ? 0.0f : 1.0f;
+
+    for (int i = 0, effect_id; i < num_effects; i++)
+    {
+        effect_id = effects[i];
+        if (InstanceExist(effect_id))
+        {
+            effect = &g_effects[effect_id];
+            effect->bypass_port.prev_value = bypass_value;
+
+            if (effect->enabled_index >= 0)
+            {
+                port = effect->ports[effect->enabled_index];
+                port->prev_value = *port->buffer = enabled_value;
+            }
+        }
     }
 
     return SUCCESS;
@@ -6995,7 +8240,7 @@ int effects_licensee(int effect_id, char **licensee_ptr)
 int effects_set_beats_per_minute(double bpm)
 {
   int result = SUCCESS;
-  if ((20.0 <= bpm) && (bpm <= 280.0)) {
+  if ((20.0 <= bpm) && (bpm <= 300.0)) {
     // Change the current global value and set a flag that it was changed.
     g_transport_bpm = bpm;
     g_transport_reset = true;
@@ -7046,8 +8291,7 @@ int effects_cc_map(int effect_id, const char *control_symbol, int device_id, int
     if (port == NULL)
         return ERR_LV2_INVALID_PARAM_SYMBOL;
 
-    cc_assignment_t assignment;
-    memset(&assignment, 0, sizeof(assignment));
+    cc_assignment_t assignment = {0};
     assignment.device_id = device_id;
     assignment.actuator_id = actuator_id;
     assignment.label = label;
@@ -7245,7 +8489,7 @@ int effects_cc_value_set(int effect_id, const char *control_symbol, float value)
                     fflush(stdout);
                 }
 
-                cc_set_value_t update;
+                cc_set_value_t update = {0};
                 update.device_id = assignment->device_id;
                 update.assignment_id = assignment->assignment_id;
                 update.actuator_id = assignment->actuator_id;
@@ -7292,19 +8536,19 @@ int effects_cc_unmap(int effect_id, const char *control_symbol)
             if (assignment->effect_id == effect_id && assignment->port != NULL &&
                 strcmp(assignment->port->symbol, control_symbol) == 0)
             {
-                cc_assignment_key_t key;
-                key.device_id = assignment->device_id;
+                cc_assignment_key_t key = {0};
                 key.id = assignment->assignment_id;
+                key.device_id = assignment->device_id;
                 key.pair_id = assignment->assignment_pair_id;
 
-                memset(assignment, 0, sizeof(assignment_t));
+                mod_memset(assignment, 0, sizeof(assignment_t));
                 assignment->effect_id = ASSIGNMENT_UNUSED;
                 assignment->assignment_pair_id = -1;
 
                 if (key.pair_id != -1)
                 {
                     assignment = &g_assignments_list[i][key.pair_id];
-                    memset(assignment, 0, sizeof(assignment_t));
+                    mod_memset(assignment, 0, sizeof(assignment_t));
                     assignment->effect_id = ASSIGNMENT_UNUSED;
                     assignment->assignment_pair_id = -1;
                 }
@@ -7448,7 +8692,7 @@ int effects_cv_map(int effect_id, const char *control_symbol, const char *source
                 const char *source_symbol = NULL;
                 int source_effect_id = -1;
 
-                memset(effect_str, 0, sizeof(effect_str));
+                mod_memset(effect_str, 0, sizeof(effect_str));
                 strncpy(effect_str, source_port_name+7, 5);
 
                 for (int i=1; i<6; ++i) {
@@ -7604,7 +8848,7 @@ int effects_cv_unmap(int effect_id, const char *control_symbol)
 int effects_hmi_map(int effect_id, const char *control_symbol, int hw_id, int page, int subpage,
                     int caps, int flags, const char *label, float minimum, float maximum, int steps)
 {
-#ifdef __MOD_DEVICES__
+#ifdef MOD_HMI_CONTROL_ENABLED
     if (!InstanceExist(effect_id))
         return ERR_INSTANCE_NON_EXISTS;
     if (effect_id >= MAX_PLUGIN_INSTANCES)
@@ -7696,7 +8940,7 @@ int effects_hmi_map(int effect_id, const char *control_symbol, int hw_id, int pa
 
 int effects_hmi_unmap(int effect_id, const char *control_symbol)
 {
-#ifdef __MOD_DEVICES__
+#ifdef MOD_HMI_CONTROL_ENABLED
     if (!InstanceExist(effect_id))
         return ERR_INSTANCE_NON_EXISTS;
 
@@ -7756,6 +9000,15 @@ int effects_hmi_unmap(int effect_id, const char *control_symbol)
 float effects_jack_cpu_load(void)
 {
     return jack_cpu_load(g_jack_global_client);
+}
+
+float effects_jack_max_cpu_load(void)
+{
+#ifdef HAVE_JACK2_1_9_23
+    return jack_max_cpu_load(g_jack_global_client);
+#else
+    return jack_cpu_load(g_jack_global_client);
+#endif
 }
 
 #define OS_SEP '/'
@@ -7855,7 +9108,7 @@ int effects_state_load(const char *dir)
     LilvState *state;
 
     char state_filename[PATH_MAX];
-    bzero(state_filename, sizeof(state_filename));
+    memset(state_filename, 0, sizeof(state_filename));
 
     LV2_State_Make_Path makePath = {
         NULL, MakePluginStatePathDuringLoadSave
@@ -7867,7 +9120,7 @@ int effects_state_load(const char *dir)
         &g_urid_map_feature,
         &g_urid_unmap_feature,
         &g_options_feature,
-#ifdef __MOD_DEVICES__
+#ifdef MOD_HMI_CONTROL_ENABLED
         &g_hmi_wc_feature,
 #endif
         &g_license_feature,
@@ -7878,6 +9131,7 @@ int effects_state_load(const char *dir)
         &g_state_freePath_feature,
         &feature_makePath,
         NULL, // ctrlPortReq
+        NULL, // ctrlPortStateUpdate
         NULL, // worker
         NULL
     };
@@ -7907,6 +9161,7 @@ int effects_state_load(const char *dir)
 
         makePath.handle = effect;
         features[CTRLPORT_REQUEST_FEATURE] = effect->features[CTRLPORT_REQUEST_FEATURE];
+        features[CTRLPORT_STATE_FEATURE] = effect->features[CTRLPORT_STATE_FEATURE];
         features[WORKER_FEATURE] = effect->features[WORKER_FEATURE];
 
         if (effect->hints & HINT_STATE_UNSAFE)
@@ -7933,7 +9188,11 @@ int effects_state_load(const char *dir)
 
 int effects_state_save(const char *dir)
 {
+#ifdef _WIN32
+    if (_access(dir, 4) != 0 && _mkdir(dir) != 0)
+#else
     if (access(dir, F_OK) != 0 && mkdir(dir, 0755) != 0)
+#endif
     {
         fprintf(stderr, "failed to get access to project folder %s\n", dir);
         return ERR_INVALID_OPERATION;
@@ -7944,7 +9203,7 @@ int effects_state_save(const char *dir)
     char *scratch_dir, *plugin_dir;
 
     char state_dir[PATH_MAX];
-    bzero(state_dir, sizeof(state_dir));
+    memset(state_dir, 0, sizeof(state_dir));
 
     LV2_State_Make_Path makePath = {
         NULL, MakePluginStatePathDuringLoadSave
@@ -7956,7 +9215,7 @@ int effects_state_save(const char *dir)
         &g_urid_map_feature,
         &g_urid_unmap_feature,
         &g_options_feature,
-#ifdef __MOD_DEVICES__
+#ifdef MOD_HMI_CONTROL_ENABLED
         &g_hmi_wc_feature,
 #endif
         &g_license_feature,
@@ -7967,6 +9226,7 @@ int effects_state_save(const char *dir)
         &g_state_freePath_feature,
         &feature_makePath,
         NULL, // ctrlPortReq
+        NULL, // ctrlPortStateUpdate
         NULL, // worker
         NULL
     };
@@ -7990,6 +9250,7 @@ int effects_state_save(const char *dir)
 
             makePath.handle = effect;
             features[CTRLPORT_REQUEST_FEATURE] = effect->features[CTRLPORT_REQUEST_FEATURE];
+            features[CTRLPORT_STATE_FEATURE] = effect->features[CTRLPORT_STATE_FEATURE];
             features[WORKER_FEATURE] = effect->features[WORKER_FEATURE];
 
             effect->state_dir = dir;
@@ -8167,6 +9428,16 @@ int effects_aggregated_midi_enable(int enable)
     return SUCCESS;
 }
 
+int effects_cpu_load_enable(int enable)
+{
+    if (g_jack_global_client == NULL)
+        return ERR_INVALID_OPERATION;
+
+    g_cpu_load_enabled = enable != 0;
+    effects_output_data_ready();
+    return SUCCESS;
+}
+
 int effects_freewheeling_enable(int enable)
 {
     if (g_jack_global_client == NULL)
@@ -8180,12 +9451,126 @@ int effects_freewheeling_enable(int enable)
 
 int effects_processing_enable(int enable)
 {
-    g_processing_enabled = enable;
+    switch (enable)
+    {
+    // regular on/off
+    case 0:
+    case 1:
+        g_processing_enabled = enable != 0;
+        break;
 
-    if (enable > 1) {
+    // turn on while reporting feedback data ready
+    case 2:
+        g_processing_enabled = true;
         effects_output_data_ready();
+        break;
+
+    // use fade-out while turning off
+    case -1:
+        monitor_client_setup_volume(MOD_MONITOR_VOLUME_MUTE);
+        if (g_processing_enabled)
+        {
+            monitor_client_wait_volume();
+            g_processing_enabled = false;
+        }
+        break;
+
+    // don't use fade-out while turning off, mute right away
+    case -2:
+        monitor_client_setup_volume(MOD_MONITOR_VOLUME_MUTE);
+        monitor_client_flush_volume();
+        g_processing_enabled = false;
+        break;
+
+    // use fade-in while turning on
+    case 3:
+        g_processing_enabled = true;
+        monitor_client_setup_volume(0.f);
+        break;
+
+    default:
+        return ERR_INVALID_OPERATION;
     }
 
+    return SUCCESS;
+}
+
+int effects_monitor_audio_levels(const char *source_port_name, int enable)
+{
+    if (g_jack_global_client == NULL)
+        return ERR_INVALID_OPERATION;
+
+    if (enable)
+    {
+        for (int i = 0; i < g_audio_monitor_count; ++i)
+        {
+            if (!strcmp(g_audio_monitors[i].source_port_name, source_port_name))
+                return SUCCESS;
+        }
+
+        pthread_mutex_lock(&g_audio_monitor_mutex);
+        g_audio_monitors = realloc(g_audio_monitors, sizeof(audio_monitor_t) * (g_audio_monitor_count + 1));
+        pthread_mutex_unlock(&g_audio_monitor_mutex);
+
+        if (g_audio_monitors == NULL)
+            return ERR_MEMORY_ALLOCATION;
+
+        audio_monitor_t *monitor = &g_audio_monitors[g_audio_monitor_count];
+
+        char port_name[0xff];
+        snprintf(port_name, sizeof(port_name) - 1, "monitor_%d", g_audio_monitor_count + 1);
+
+        jack_port_t *port = jack_port_register(g_jack_global_client,
+                                               port_name,
+                                               JACK_DEFAULT_AUDIO_TYPE,
+                                               JackPortIsInput,
+                                               0);
+        if (port == NULL)
+            return ERR_JACK_PORT_REGISTER;
+
+        snprintf(port_name, sizeof(port_name) - 1, "%s:monitor_%d",
+                 jack_get_client_name(g_jack_global_client), g_audio_monitor_count + 1);
+        jack_connect(g_jack_global_client, source_port_name, port_name);
+
+        monitor->port = port;
+        monitor->source_port_name = strdup(source_port_name);
+        monitor->value = 0.f;
+
+        ++g_audio_monitor_count;
+    }
+    else
+    {
+        if (g_audio_monitor_count == 0)
+            return ERR_INVALID_OPERATION;
+
+        audio_monitor_t *monitor = &g_audio_monitors[g_audio_monitor_count - 1];
+
+        if (strcmp(monitor->source_port_name, source_port_name))
+            return ERR_INVALID_OPERATION;
+
+        pthread_mutex_lock(&g_audio_monitor_mutex);
+        --g_audio_monitor_count;
+        pthread_mutex_unlock(&g_audio_monitor_mutex);
+
+        jack_port_unregister(g_jack_global_client, monitor->port);
+        free(monitor->source_port_name);
+
+        if (g_audio_monitor_count == 0)
+        {
+            free(g_audio_monitors);
+            g_audio_monitors = NULL;
+        }
+    }
+
+    return SUCCESS;
+}
+
+int effects_monitor_midi_control(int channel, int enable)
+{
+    if (channel < 0 || channel > 15)
+        return ERR_INVALID_OPERATION;
+
+    g_monitored_midi_controls[channel] = enable != 0;
     return SUCCESS;
 }
 
@@ -8241,6 +9626,7 @@ void effects_transport(int rolling, double beats_per_bar, double beats_per_minut
         else
         {
             jack_transport_stop(g_jack_global_client);
+            jack_transport_locate(g_jack_global_client, 0);
             if (g_verbose_debug) {
                 puts("DEBUG: effects_transport stopped rolling and relocated to frame 0");
             }
@@ -8306,6 +9692,33 @@ int effects_transport_sync_mode(const char* mode)
     return SUCCESS;
 }
 
+void effect_sync_scheduled_params(int realtime)
+{
+    port_t *port;
+
+    if (realtime != 0)
+    {
+        if (pthread_mutex_trylock(&g_sync_scheduled_params_mutex) != 0)
+            return;
+    }
+    else
+    {
+        pthread_mutex_lock(&g_sync_scheduled_params_mutex);
+    }
+
+    for (unsigned int i = 0; i < g_sync_scheduled_param_count; i++)
+    {
+        port = g_sync_scheduled_params[i].port;
+        port->prev_value = *port->buffer = g_sync_scheduled_params[i].value;
+#ifdef WITH_EXTERNAL_UI_SUPPORT
+        port->hints |= HINT_SHOULD_UPDATE;
+#endif
+    }
+
+    g_sync_scheduled_param_count = 0;
+    pthread_mutex_unlock(&g_sync_scheduled_params_mutex);
+}
+
 void effects_output_data_ready(void)
 {
     if (g_verbose_debug) {
@@ -8319,4 +9732,161 @@ void effects_output_data_ready(void)
         g_postevents_ready = true;
         sem_post(&g_postevents_semaphore);
     }
+}
+
+int effects_show_external_ui(int effect_id)
+{
+#ifdef WITH_EXTERNAL_UI_SUPPORT
+    if (!InstanceExist(effect_id))
+        return ERR_INSTANCE_NON_EXISTS;
+    if (effect_id >= MAX_PLUGIN_INSTANCES)
+        return ERR_ASSIGNMENT_INVALID_OP;
+
+    effect_t *effect = &g_effects[effect_id];
+    LilvUIs *uis = lilv_plugin_get_uis(effect->lilv_plugin);
+
+    if (uis == NULL)
+        return ERR_ASSIGNMENT_INVALID_OP;
+
+    LILV_FOREACH(nodes, i, uis)
+    {
+        const LilvUI *ui = lilv_uis_get(uis, i);
+        lilv_world_load_resource(g_lv2_data, lilv_ui_get_uri(ui));
+
+        const LilvNode *binary_node = lilv_ui_get_binary_uri(ui);
+        const LilvNode *bundle_node = lilv_ui_get_bundle_uri(ui);
+
+        void *libhandle = dlopen(lilv_file_uri_parse(lilv_node_as_string(binary_node), NULL), RTLD_NOW|RTLD_LOCAL);
+        if (libhandle == NULL)
+            continue;
+
+        // stuff that could need cleanup
+        LV2UI_Handle *handle = NULL;
+        const LV2UI_Descriptor *desc = NULL;
+        const LV2UI_Idle_Interface *idle_iface;
+        const LV2UI_Show_Interface *show_iface;
+        uint32_t index = 0;
+
+        LV2UI_DescriptorFunction descfn;
+        if ((descfn = (LV2UI_DescriptorFunction)dlsym(libhandle, "lv2ui_descriptor")) == NULL)
+            goto cleanup;
+
+        while ((desc = descfn(index++)) != NULL)
+        {
+            if (desc->extension_data == NULL)
+                continue;
+            if ((idle_iface = desc->extension_data(LV2_UI__idleInterface)) == NULL)
+                continue;
+            if ((show_iface = desc->extension_data(LV2_UI__showInterface)) == NULL)
+                continue;
+
+            // if we got this far, we have everything needed
+            LV2_Extension_Data_Feature extension_data = {
+                effect->lilv_instance->lv2_descriptor->extension_data
+            };
+            const LV2_Feature feature_dataAccess = { LV2_DATA_ACCESS_URI, &extension_data };
+            const LV2_Feature feature_instAccess = { LV2_INSTANCE_ACCESS_URI, effect->lilv_instance->lv2_handle };
+            const LV2_Feature* features[] = {
+                &g_uri_map_feature,
+                &g_urid_map_feature,
+                &g_urid_unmap_feature,
+                &g_options_feature,
+                &g_buf_size_features[0],
+                &g_buf_size_features[1],
+                &g_buf_size_features[2],
+                &g_lv2_log_feature,
+                &feature_dataAccess,
+                &feature_instAccess,
+                NULL
+            };
+
+            LV2UI_Widget widget;
+            handle = desc->instantiate(desc,
+                                       lilv_node_as_uri(lilv_plugin_get_uri(effect->lilv_plugin)),
+                                       lilv_file_uri_parse(lilv_node_as_string(bundle_node), NULL),
+                                       ExternalControllerWriteFunction,
+                                       effect, &widget, features);
+
+            if (handle == NULL)
+                continue;
+
+            // notify UI of current state
+            if (desc->port_event != NULL)
+            {
+                for (uint32_t j = 0; j < effect->control_ports_count; j++)
+                    desc->port_event(handle,
+                                     effect->control_ports[j]->index,
+                                     sizeof(float), 0,
+                                     effect->control_ports[j]->buffer);
+            }
+
+            show_iface->show(handle);
+
+            effect->ui_desc = desc;
+            effect->ui_handle = handle;
+            effect->ui_idle_iface = idle_iface;
+            effect->ui_libhandle = libhandle;
+
+            lilv_uis_free(uis);
+            return SUCCESS;
+        }
+
+cleanup:
+        if (desc != NULL && handle != NULL && desc->cleanup != NULL)
+            desc->cleanup(handle);
+
+        dlclose(libhandle);
+    }
+
+    lilv_uis_free(uis);
+    return ERR_INVALID_OPERATION;
+#else
+    return ERR_EXTERNAL_UI_UNAVAILABLE;
+
+    UNUSED_PARAM(effect_id);
+#endif
+}
+
+void effects_idle_external_uis(void)
+{
+#ifdef WITH_EXTERNAL_UI_SUPPORT
+    for (int i = 0; i < MAX_PLUGIN_INSTANCES; ++i)
+    {
+        effect_t *effect = &g_effects[i];
+
+        if (effect->lilv_instance == NULL)
+            continue;
+        if (effect->lilv_plugin == NULL)
+            continue;
+
+        if (effect->ui_handle && effect->ui_idle_iface)
+        {
+            if (effect->ui_desc->port_event != NULL)
+            {
+                port_t *port;
+                for (uint32_t j = 0; j < effect->input_control_ports_count; j++)
+                {
+                    port = effect->input_control_ports[j];
+                    if (port->hints & HINT_SHOULD_UPDATE)
+                    {
+                        port->hints &= ~HINT_SHOULD_UPDATE;
+                        effect->ui_desc->port_event(effect->ui_handle,
+                                                    port->index,
+                                                    sizeof(float), 0,
+                                                    port->buffer);
+                    }
+                }
+                for (uint32_t j = 0; j < effect->output_control_ports_count; j++)
+                {
+                    effect->ui_desc->port_event(effect->ui_handle,
+                                                effect->output_control_ports[j]->index,
+                                                sizeof(float), 0,
+                                                effect->output_control_ports[j]->buffer);
+                }
+            }
+
+            effect->ui_idle_iface->idle(effect->ui_handle);
+        }
+    }
+#endif
 }

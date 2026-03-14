@@ -46,6 +46,14 @@
 ************************************************************************************************************************
 */
 
+#if defined(_DARKGLASS_DEVICE_PABLITO)
+#define MOD_MONITOR_VOLUME_MUTE -60.f
+#define MOD_MONITOR_VOLUME_WAIT 0.02f
+#else
+#define MOD_MONITOR_VOLUME_MUTE -30.f
+#define MOD_MONITOR_VOLUME_WAIT 0.03f
+#endif
+
 
 /*
 ************************************************************************************************************************
@@ -79,6 +87,8 @@ void monitor_client_stop(void);
 
 bool monitor_client_setup_compressor(int mode, float release);
 bool monitor_client_setup_volume(float volume);
+bool monitor_client_flush_volume(void);
+bool monitor_client_wait_volume(void);
 
 
 /*

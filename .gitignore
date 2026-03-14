@@ -1,4 +1,5 @@
 *~
+*.exe
 *.o
 *.so
 *.pyc
@@ -13,5 +14,6 @@ mod-host.install
 mod-host.service
 tests/effectlib_test
 tests/rtmempool-test
+tests/self-test-result.json
 src/info.h
 PKGBUILD

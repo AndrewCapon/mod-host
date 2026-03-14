@@ -19,16 +19,31 @@
 #ifndef URID_H
 #define URID_H
 
-#include <lv2/lv2plug.in/ns/ext/urid/urid.h>
-#include <lv2/lv2plug.in/ns/ext/uri-map/uri-map.h>
+#include <lv2/urid/urid.h>
+#include <lv2/uri-map/uri-map.h>
 
 void urid_sem_init(void);
 
 LV2_URID map_urid(LV2_URID_Map_Handle handle, const char* uri);
 const char* unmap_urid(LV2_URID_Unmap_Handle handle, LV2_URID urid);
 
-uint32_t uri_to_id(LV2_URI_Map_Callback_Data callback_data, const char* map, const char* uri);
 LV2_URID urid_to_id(LV2_URID_Map_Handle handle, const char* uri);
 const char* id_to_urid(LV2_URID_Unmap_Handle handle, LV2_URID urid);
+
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__GNUC__) && (__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 6))
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+
+uint32_t uri_to_id(LV2_URI_Map_Callback_Data callback_data, const char* map, const char* uri);
+
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__) && (__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 6))
+#pragma GCC diagnostic pop
+#endif
 
 #endif

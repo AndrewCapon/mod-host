@@ -70,6 +70,7 @@ enum {
     ERR_CONTROL_CHAIN_UNAVAILABLE = -401,
     ERR_ABLETON_LINK_UNAVAILABLE = -402,
     ERR_HMI_UNAVAILABLE = -403,
+    ERR_EXTERNAL_UI_UNAVAILABLE = -404,
 
     ERR_MEMORY_ALLOCATION = -901,
     ERR_INVALID_OPERATION = -902
@@ -96,6 +97,8 @@ typedef enum {
 #define MAX_POSTPONED_EVENTS    8192
 #define MAX_HMI_ADDRESSINGS     128
 
+#define MAX_SYNC_SCHEDULED_PARAMS 512
+
 // used for local stack variables
 #define MAX_CHAR_BUF_SIZE       255
 
@@ -110,6 +113,11 @@ typedef struct {
     const char *label;
     float value;
 } scalepoint_t;
+
+typedef struct {
+    const char *symbol;
+    float value;
+} flushed_param_t;
 
 
 /*
@@ -134,20 +142,30 @@ typedef struct {
 
 int effects_init(void* client);
 int effects_finish(int close_client);
-int effects_add(const char *uri, int instance);
+int effects_add(const char *uri, int instance, int activate);
+int effects_add_multi(int activate, int num_effects, int *effects, const char *const *uris);
 int effects_remove(int effect_id);
+int effects_remove_multi(int num_effects, int *effects);
+int effects_activate(int effect_id, int value);
+int effects_activate_multi(int value, int num_effects, int *effects);
 int effects_preset_load(int effect_id, const char *uri);
 int effects_preset_save(int effect_id, const char *dir, const char *file_name, const char *label);
 int effects_preset_show(const char *uri, char **state_str);
-int effects_connect(const char *portA, const char *portB);
-int effects_disconnect(const char *portA, const char *portB);
+int effects_connect(const char *portA, const char *portB, int check);
+int effects_connect_matching(const char *matching, const char *port);
+int effects_disconnect(const char *portA, const char *portB, int check);
+int effects_disconnect_all(const char *port);
 int effects_set_parameter(int effect_id, const char *control_symbol, float value);
+int effects_set_parameter_multi(const char *control_symbol, float value, int num_effects, int *effects);
 int effects_get_parameter(int effect_id, const char *control_symbol, float *value);
+int effects_flush_parameters(int effect_id, int reset, int param_count, const flushed_param_t *params);
+int effects_flush_parameters_multi(int reset, int param_count, const flushed_param_t *params, int num_effects, int *effects);
 int effects_set_property(int effect_id, const char *uri, const char *value);
 int effects_get_property(int effect_id, const char *uri);
 int effects_monitor_parameter(int effect_id, const char *control_symbol, const char *op, float value);
-int effects_monitor_output_parameter(int effect_id, const char *control_symbol);
+int effects_monitor_output_parameter(int effect_id, const char *control_symbol, int enable);
 int effects_bypass(int effect_id, int value);
+int effects_bypass_multi(int value, int num_effects, int *effects);
 int effects_get_parameter_symbols(int effect_id, int output_ports, const char** symbols);
 int effects_get_presets_uris(int effect_id, const char **uris);
 int effects_get_parameter_info(int effect_id, const char *control_symbol, float **range, const char **scale_points);
@@ -172,18 +190,25 @@ int effects_hmi_map(int effect_id, const char *control_symbol, int hw_id, int pa
 int effects_hmi_unmap(int effect_id, const char *control_symbol);
 
 float effects_jack_cpu_load(void);
+float effects_jack_max_cpu_load(void);
 void effects_bundle_add(const char *bundlepath);
 void effects_bundle_remove(const char *bundlepath, const char *resource);
 int effects_state_load(const char *dir);
 int effects_state_save(const char *dir);
 int effects_state_set_tmpdir(const char *dir);
 int effects_aggregated_midi_enable(int enable);
+int effects_cpu_load_enable(int enable);
 int effects_freewheeling_enable(int enable);
 int effects_processing_enable(int enable);
+int effects_monitor_audio_levels(const char *source_port_name, int enable);
+int effects_monitor_midi_control(int channel, int enable);
 int effects_monitor_midi_program(int channel, int enable);
 void effects_transport(int rolling, double beats_per_bar, double beats_per_minute);
 int effects_transport_sync_mode(const char *mode);
+void effect_sync_scheduled_params(int realtime);
 void effects_output_data_ready(void);
+int effects_show_external_ui(int effect_id);
+void effects_idle_external_uis(void);
 
 /*
 ************************************************************************************************************************

@@ -33,10 +33,13 @@
 #include <stdlib.h>
 #include <fcntl.h>
 #include <string.h>
-#include <unistd.h>
 #include <getopt.h>
 #include <jack/jack.h>
 #include <signal.h>
+
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #ifndef SKIP_READLINE
 #include <readline/readline.h>
@@ -57,12 +60,21 @@
 #define lilv_free(x) free(x)
 #endif
 
+#if defined(_DARKGLASS_DEVICE_PABLITO)
+#include <sys/resource.h>
+#elif defined(_MOD_DEVICE_DUO) || defined(_MOD_DEVICE_DUOX) || defined(_MOD_DEVICE_DWARF)
+#include <sys/resource.h>
+#include <syscall.h>
+#include <unistd.h>
+#endif
+
 #include "mod-host.h"
 #include "effects.h"
 #include "socket.h"
 #include "protocol.h"
 #include "completer.h"
 #include "monitor.h"
+#include "zix/thread.h"
 #include "info.h"
 
 
@@ -84,7 +96,7 @@
 /* Wherever we should be running */
 static volatile int running;
 /* Thread that calls socket_run() for the JACK internal client */
-static pthread_t intclient_socket_thread;
+static ZixThread intclient_socket_thread;
 
 /*
 ************************************************************************************************************************
@@ -130,7 +142,7 @@ static pthread_t intclient_socket_thread;
 static void effects_add_cb(proto_t *proto)
 {
     int resp;
-    resp = effects_add(proto->list[1], atoi(proto->list[2]));
+    resp = effects_add(proto->list[1], atoi(proto->list[2]), 1);
     protocol_response_int(resp, proto);
 }
 
@@ -138,6 +150,20 @@ static void effects_remove_cb(proto_t *proto)
 {
     int resp;
     resp = effects_remove(atoi(proto->list[1]));
+    protocol_response_int(resp, proto);
+}
+
+static void effects_activate_cb(proto_t *proto)
+{
+    int resp;
+    resp = effects_activate(atoi(proto->list[1]), atoi(proto->list[2]));
+    protocol_response_int(resp, proto);
+}
+
+static void effects_preload_cb(proto_t *proto)
+{
+    int resp;
+    resp = effects_add(proto->list[1], atoi(proto->list[2]), 0);
     protocol_response_int(resp, proto);
 }
 
@@ -173,14 +199,42 @@ static void effects_preset_show_cb(proto_t *proto)
 static void effects_connect_cb(proto_t *proto)
 {
     int resp;
-    resp = effects_connect(proto->list[1], proto->list[2]);
+    resp = effects_connect(proto->list[1], proto->list[2], 0);
+    protocol_response_int(resp, proto);
+}
+
+static void effects_connect_matching_cb(proto_t *proto)
+{
+    int resp;
+    resp = effects_connect_matching(proto->list[1], proto->list[2]);
+    protocol_response_int(resp, proto);
+}
+
+static void effects_connect_safe_cb(proto_t *proto)
+{
+    int resp;
+    resp = effects_connect(proto->list[1], proto->list[2], 1);
     protocol_response_int(resp, proto);
 }
 
 static void effects_disconnect_cb(proto_t *proto)
 {
     int resp;
-    resp = effects_disconnect(proto->list[1], proto->list[2]);
+    resp = effects_disconnect(proto->list[1], proto->list[2], 0);
+    protocol_response_int(resp, proto);
+}
+
+static void effects_disconnect_all_cb(proto_t *proto)
+{
+    int resp;
+    resp = effects_disconnect_all(proto->list[1]);
+    protocol_response_int(resp, proto);
+}
+
+static void effects_disconnect_safe_cb(proto_t *proto)
+{
+    int resp;
+    resp = effects_disconnect(proto->list[1], proto->list[2], 1);
     protocol_response_int(resp, proto);
 }
 
@@ -223,6 +277,39 @@ static void effects_monitor_param_cb(proto_t *proto)
         resp = -1;
 
     protocol_response_int(resp, proto);
+}
+
+static void effects_flush_params_cb(proto_t *proto)
+{
+    int resp;
+    int param_count = atoi(proto->list[3]);
+    flushed_param_t *params;
+
+    if (param_count != 0)
+    {
+        params = malloc(sizeof(flushed_param_t) * param_count);
+
+        if (params == NULL)
+        {
+            protocol_response_int(ERR_MEMORY_ALLOCATION, proto);
+            return;
+        }
+
+        for (int i = 0; i < param_count; i++)
+        {
+            params[i].symbol = proto->list[4 + i * 2];
+            params[i].value = atof(proto->list[5 + i * 2]);
+        }
+    }
+    else
+    {
+        params = NULL;
+    }
+
+    resp = effects_flush_parameters(atoi(proto->list[1]), atoi(proto->list[2]), param_count, params);
+    protocol_response_int(resp, proto);
+
+    free(params);
 }
 
 static void effects_set_property_cb(proto_t *proto)
@@ -292,7 +379,28 @@ static void monitor_addr_set_cb(proto_t *proto)
 static void monitor_output_cb(proto_t *proto)
 {
     int resp;
-    resp = !effects_monitor_output_parameter(atoi(proto->list[1]), proto->list[2]);
+    resp = !effects_monitor_output_parameter(atoi(proto->list[1]), proto->list[2], 1);
+    protocol_response_int(resp, proto);
+}
+
+static void monitor_output_off_cb(proto_t *proto)
+{
+    int resp;
+    resp = !effects_monitor_output_parameter(atoi(proto->list[1]), proto->list[2], 0);
+    protocol_response_int(resp, proto);
+}
+
+static void monitor_audio_levels_cb(proto_t *proto)
+{
+    int resp;
+    resp = effects_monitor_audio_levels(proto->list[1], atoi(proto->list[2]));
+    protocol_response_int(resp, proto);
+}
+
+static void monitor_midi_control_cb(proto_t *proto)
+{
+    int resp;
+    resp = effects_monitor_midi_control(atoi(proto->list[1]), atoi(proto->list[2]));
     protocol_response_int(resp, proto);
 }
 
@@ -358,6 +466,7 @@ static void cc_map_cb(proto_t *proto)
     }
     else
     {
+        scalepoints_count = 0;
         scalepoints = NULL;
     }
 
@@ -439,6 +548,15 @@ static void hmi_unmap_cb(proto_t *proto)
 static void cpu_load_cb(proto_t *proto)
 {
     float value = effects_jack_cpu_load();
+    char buffer[128];
+    sprintf(buffer, "resp 0 %.04f", value);
+
+    protocol_response(buffer, proto);
+}
+
+static void max_cpu_load_cb(proto_t *proto)
+{
+    float value = effects_jack_max_cpu_load();
     char buffer[128];
     sprintf(buffer, "resp 0 %.04f", value);
 
@@ -537,6 +655,8 @@ static void feature_enable(proto_t *proto)
 
     if (!strcmp(feature, "aggregated-midi"))
         resp = effects_aggregated_midi_enable(enabled);
+    else if (!strcmp(feature, "cpu-load"))
+        resp = effects_cpu_load_enable(enabled);
     else if (!strcmp(feature, "freewheeling"))
         resp = effects_freewheeling_enable(enabled);
     else if (!strcmp(feature, "processing"))
@@ -560,10 +680,248 @@ static void transport_sync(proto_t *proto)
     protocol_response_int(resp, proto);
 }
 
+static void show_external_ui(proto_t *proto)
+{
+    const int resp = effects_show_external_ui(atoi(proto->list[1]));
+    protocol_response_int(resp, proto);
+}
+
 static void output_data_ready(proto_t *proto)
 {
     effects_output_data_ready();
     protocol_response("resp 0", proto);
+}
+
+static void multi_add(proto_t *proto)
+{
+    int instance_count = atoi(proto->list[1]);
+    if (instance_count == 0)
+    {
+        protocol_response_int(ERR_ASSIGNMENT_INVALID_OP, proto);
+        return;
+    }
+
+    int *instances = malloc(sizeof(int) * instance_count);
+    const char **uris = malloc(sizeof(const char *) * instance_count);
+    if (instances != NULL && uris != NULL)
+    {
+        for (int i = 0; i < instance_count; i++)
+        {
+            uris[i] = proto->list[2 + i * 2];
+            instances[i] = atoi(proto->list[3 + i * 2]);
+        }
+    }
+    else
+    {
+        free(instances);
+        free(uris);
+        protocol_response_int(ERR_MEMORY_ALLOCATION, proto);
+        return;
+    }
+
+    int resp = effects_add_multi(1, instance_count, instances, uris);
+    protocol_response_int(resp, proto);
+
+    free(instances);
+    free(uris);
+}
+
+static void multi_remove(proto_t *proto)
+{
+    int instance_count = atoi(proto->list[1]);
+    if (instance_count == 0)
+    {
+        protocol_response_int(ERR_ASSIGNMENT_INVALID_OP, proto);
+        return;
+    }
+
+    int *instances = malloc(sizeof(int) * instance_count);
+    if (instances != NULL)
+    {
+        for (int i = 0; i < instance_count; i++)
+            instances[i] = atoi(proto->list[2 + i]);
+    }
+    else
+    {
+        protocol_response_int(ERR_MEMORY_ALLOCATION, proto);
+        return;
+    }
+
+    int resp = effects_remove_multi(instance_count, instances);
+    protocol_response_int(resp, proto);
+
+    free(instances);
+}
+
+static void multi_activate(proto_t *proto)
+{
+    int instance_count = atoi(proto->list[2]);
+    if (instance_count == 0)
+    {
+        protocol_response_int(ERR_ASSIGNMENT_INVALID_OP, proto);
+        return;
+    }
+
+    int *instances = malloc(sizeof(int) * instance_count);
+    if (instances != NULL)
+    {
+        for (int i = 0; i < instance_count; i++)
+            instances[i] = atoi(proto->list[3 + i]);
+    }
+    else
+    {
+        protocol_response_int(ERR_MEMORY_ALLOCATION, proto);
+        return;
+    }
+
+    int resp = effects_activate_multi(atoi(proto->list[1]), instance_count, instances);
+    protocol_response_int(resp, proto);
+
+    free(instances);
+}
+
+static void multi_preload(proto_t *proto)
+{
+    int instance_count = atoi(proto->list[1]);
+    if (instance_count == 0)
+    {
+        protocol_response_int(ERR_ASSIGNMENT_INVALID_OP, proto);
+        return;
+    }
+
+    int *instances = malloc(sizeof(int) * instance_count);
+    const char **uris = malloc(sizeof(const char *) * instance_count);
+    if (instances != NULL && uris != NULL)
+    {
+        for (int i = 0; i < instance_count; i++)
+        {
+            uris[i] = proto->list[2 + i * 2];
+            instances[i] = atoi(proto->list[3 + i * 2]);
+        }
+    }
+    else
+    {
+        free(instances);
+        free(uris);
+        protocol_response_int(ERR_MEMORY_ALLOCATION, proto);
+        return;
+    }
+
+    int resp = effects_add_multi(0, instance_count, instances, uris);
+    protocol_response_int(resp, proto);
+
+    free(instances);
+    free(uris);
+}
+
+static void multi_bypass(proto_t *proto)
+{
+    int instance_count = atoi(proto->list[2]);
+    if (instance_count == 0)
+    {
+        protocol_response_int(ERR_ASSIGNMENT_INVALID_OP, proto);
+        return;
+    }
+
+    int *instances = malloc(sizeof(int) * instance_count);
+
+    if (instances != NULL)
+    {
+        for (int i = 0; i < instance_count; i++)
+            instances[i] = atoi(proto->list[3 + i]);
+    }
+    else
+    {
+        protocol_response_int(ERR_MEMORY_ALLOCATION, proto);
+        return;
+    }
+
+    int resp = effects_bypass_multi(atoi(proto->list[1]), instance_count, instances);
+    protocol_response_int(resp, proto);
+
+    free(instances);
+}
+
+static void multi_param_set(proto_t *proto)
+{
+    int instance_count = atoi(proto->list[3]);
+    if (instance_count == 0)
+    {
+        protocol_response_int(ERR_ASSIGNMENT_INVALID_OP, proto);
+        return;
+    }
+
+    int *instances = malloc(sizeof(int) * instance_count);
+
+    if (instances != NULL)
+    {
+        for (int i = 0; i < instance_count; i++)
+            instances[i] = atoi(proto->list[4 + i]);
+    }
+    else
+    {
+        protocol_response_int(ERR_MEMORY_ALLOCATION, proto);
+        return;
+    }
+
+    int resp = effects_set_parameter_multi(proto->list[1], atof(proto->list[2]), instance_count, instances);
+    protocol_response_int(resp, proto);
+
+    free(instances);
+}
+
+static void multi_params_flush(proto_t *proto)
+{
+    int instance_count = atoi(proto->list[2]);
+    if (instance_count == 0)
+    {
+        protocol_response_int(ERR_ASSIGNMENT_INVALID_OP, proto);
+        return;
+    }
+
+    int *instances = malloc(sizeof(int) * instance_count);
+
+    if (instances != NULL)
+    {
+        for (int i = 0; i < instance_count; i++)
+            instances[i] = atoi(proto->list[3 + i]);
+    }
+    else
+    {
+        protocol_response_int(ERR_MEMORY_ALLOCATION, proto);
+        return;
+    }
+
+    int param_count = atoi(proto->list[3 + instance_count]);
+    flushed_param_t *params;
+
+    if (param_count != 0)
+    {
+        params = malloc(sizeof(flushed_param_t) * param_count);
+
+        if (params == NULL)
+        {
+            free(instances);
+            protocol_response_int(ERR_MEMORY_ALLOCATION, proto);
+            return;
+        }
+
+        for (int i = 0; i < param_count; i++)
+        {
+            params[i].symbol = proto->list[4 + instance_count + i * 2];
+            params[i].value = atof(proto->list[5 + instance_count + i * 2]);
+        }
+    }
+    else
+    {
+        params = NULL;
+    }
+
+    int resp = effects_flush_parameters_multi(atoi(proto->list[1]), param_count, params, instance_count, instances);
+    protocol_response_int(resp, proto);
+
+    free(instances);
+    free(params);
 }
 
 static void help_cb(proto_t *proto)
@@ -584,6 +942,23 @@ static void quit_cb(proto_t *proto)
     socket_finish();
     effects_finish(1);
     exit(EXIT_SUCCESS);
+}
+
+static void self_test_effects_set_property_cb(proto_t *proto)
+{
+    char ok = '1';
+    if (atoi(proto->list[1]) != 1337)
+        ok = '0';
+    if (strcmp(proto->list[2], "urn:test"))
+        ok = '0';
+    if (strncmp(proto->list[3], "{\n  \"version\":", 14))
+        ok = '0';
+
+    FILE* f = fopen("tests/self-test-result.json", "w");
+    fwrite(proto->list[3], strlen(proto->list[3]), 1, f);
+    fclose(f);
+
+    printf("tests ok? %c\n", ok);
 }
 
 #ifndef SKIP_READLINE
@@ -632,6 +1007,18 @@ static void term_signal(int sig)
     return; (void)sig;
 }
 
+#ifdef _WIN32
+static BOOL WINAPI win32_signal(DWORD type)
+{
+    if (type == CTRL_C_EVENT)
+    {
+        term_signal(0);
+        return TRUE;
+    }
+    return FALSE;
+}
+#endif
+
 static int mod_host_init(jack_client_t* client, int socket_port, int feedback_port)
 {
 #ifdef HAVE_FFTW335
@@ -650,15 +1037,22 @@ static int mod_host_init(jack_client_t* client, int socket_port, int feedback_po
     /* Setup the protocol */
     protocol_add_command(EFFECT_ADD, effects_add_cb);
     protocol_add_command(EFFECT_REMOVE, effects_remove_cb);
+    protocol_add_command(EFFECT_ACTIVATE, effects_activate_cb);
+    protocol_add_command(EFFECT_PRELOAD, effects_preload_cb);
     protocol_add_command(EFFECT_PRESET_LOAD, effects_preset_load_cb);
     protocol_add_command(EFFECT_PRESET_SAVE, effects_preset_save_cb);
     protocol_add_command(EFFECT_PRESET_SHOW, effects_preset_show_cb);
     protocol_add_command(EFFECT_CONNECT, effects_connect_cb);
+    protocol_add_command(EFFECT_CONNECT_MATCHING, effects_connect_matching_cb);
+    protocol_add_command(EFFECT_CONNECT_SAFE, effects_connect_safe_cb);
     protocol_add_command(EFFECT_DISCONNECT, effects_disconnect_cb);
+    protocol_add_command(EFFECT_DISCONNECT_ALL, effects_disconnect_all_cb);
+    protocol_add_command(EFFECT_DISCONNECT_SAFE, effects_disconnect_safe_cb);
     protocol_add_command(EFFECT_BYPASS, effects_bypass_cb);
     protocol_add_command(EFFECT_PARAM_SET, effects_set_param_cb);
     protocol_add_command(EFFECT_PARAM_GET, effects_get_param_cb);
     protocol_add_command(EFFECT_PARAM_MON, effects_monitor_param_cb);
+    protocol_add_command(EFFECT_PARAMS_FLUSH, effects_flush_params_cb);
     protocol_add_command(EFFECT_PATCH_GET, effects_get_property_cb);
     protocol_add_command(EFFECT_PATCH_SET, effects_set_property_cb);
     protocol_add_command(EFFECT_LICENSEE, effects_licensee_cb);
@@ -666,6 +1060,9 @@ static int mod_host_init(jack_client_t* client, int socket_port, int feedback_po
     protocol_add_command(EFFECT_SET_BPB, effects_set_beats_per_bar_cb);
     protocol_add_command(MONITOR_ADDR_SET, monitor_addr_set_cb);
     protocol_add_command(MONITOR_OUTPUT, monitor_output_cb);
+    protocol_add_command(MONITOR_OUTPUT_OFF, monitor_output_off_cb);
+    protocol_add_command(MONITOR_AUDIO_LEVELS, monitor_audio_levels_cb);
+    protocol_add_command(MONITOR_MIDI_CONTROL, monitor_midi_control_cb);
     protocol_add_command(MONITOR_MIDI_PROGRAM, monitor_midi_program_cb);
     protocol_add_command(MIDI_LEARN, midi_learn_cb);
     protocol_add_command(MIDI_MAP, midi_map_cb);
@@ -678,6 +1075,7 @@ static int mod_host_init(jack_client_t* client, int socket_port, int feedback_po
     protocol_add_command(HMI_MAP, hmi_map_cb);
     protocol_add_command(HMI_UNMAP, hmi_unmap_cb);
     protocol_add_command(CPU_LOAD, cpu_load_cb);
+    protocol_add_command(MAX_CPU_LOAD, max_cpu_load_cb);
 #ifndef SKIP_READLINE
     protocol_add_command(LOAD_COMMANDS, load_cb);
     protocol_add_command(SAVE_COMMANDS, save_cb);
@@ -690,7 +1088,15 @@ static int mod_host_init(jack_client_t* client, int socket_port, int feedback_po
     protocol_add_command(STATE_TMPDIR, state_tmpdir);
     protocol_add_command(TRANSPORT, transport);
     protocol_add_command(TRANSPORT_SYNC, transport_sync);
+    protocol_add_command(SHOW_EXTERNAL_UI, show_external_ui);
     protocol_add_command(OUTPUT_DATA_READY, output_data_ready);
+    protocol_add_command(MULTI_ADD, multi_add);
+    protocol_add_command(MULTI_REMOVE, multi_remove);
+    protocol_add_command(MULTI_ACTIVATE, multi_activate);
+    protocol_add_command(MULTI_PRELOAD, multi_preload);
+    protocol_add_command(MULTI_BYPASS, multi_bypass);
+    protocol_add_command(MULTI_PARAM_SET, multi_param_set);
+    protocol_add_command(MULTI_PARAMS_FLUSH, multi_params_flush);
 
     /* skip help and quit for internal client */
     if (client == NULL)
@@ -714,6 +1120,14 @@ static int mod_host_init(jack_client_t* client, int socket_port, int feedback_po
 
 static void* intclient_socket_run(void* ptr)
 {
+#if defined(_DARKGLASS_DEVICE_PABLITO)
+    setpriority(PRIO_PROCESS, gettid(), -19);
+#elif defined(_MOD_DEVICE_DUO) || defined(_MOD_DEVICE_DUOX) || defined(_MOD_DEVICE_DWARF)
+    const pid_t tid = syscall(SYS_gettid);
+    if (tid > 0)
+        setpriority(PRIO_PROCESS, tid, -19);
+#endif
+
     while (running)
         socket_run(0);
 
@@ -733,11 +1147,14 @@ int main(int argc, char **argv)
 {
     /* Command line options */
     static struct option long_options[] = {
+#ifndef _WIN32
         {"nofork", no_argument, 0, 'n'},
+#endif
         {"verbose", no_argument, 0, 'v'},
         {"socket-port", required_argument, 0, 'p'},
         {"feedback-port", required_argument, 0, 'f'},
         {"interactive", no_argument, 0, 'i'},
+        {"self-test", no_argument, 0, 't'},
         {"version", no_argument, 0, 'V'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
@@ -746,7 +1163,7 @@ int main(int argc, char **argv)
     int opt, opt_index = 0;
 
     /* parse command line options */
-    int nofork = 0, verbose = 0,  interactive = 0;
+    int nofork = 0, verbose = 0,  interactive = 0, selftest = 0;
     int socket_port = SOCKET_DEFAULT_PORT, feedback_port = 0;
     while ((opt = getopt_long(argc, argv, "nvp:f:iVh", long_options, &opt_index)) != -1)
     {
@@ -774,6 +1191,10 @@ int main(int argc, char **argv)
                 nofork = 1;
                 break;
 
+            case 't':
+                selftest = 1;
+                break;
+
             case 'V':
                 printf(
                     "%s version: %s\n"
@@ -792,7 +1213,9 @@ int main(int argc, char **argv)
 #ifndef SKIP_READLINE
                     "  -i, --interactive              interactive mode\n"
 #endif
+#ifndef _WIN32
                     "  -n, --nofork                   run in nonforking mode\n"
+#endif
                     "  -V, --version                  print program version and exit\n"
                     "  -h, --help                     print this help and exit\n",
                 argv[0]);
@@ -801,8 +1224,28 @@ int main(int argc, char **argv)
         }
     }
 
+    if (selftest)
+    {
+        protocol_verbose(1);
+        protocol_add_command(EFFECT_PATCH_SET, self_test_effects_set_property_cb);
+
+        msg_t msg = { 0, NULL, 0 };
+        FILE *f = fopen("tests/self-test.json", "r");
+        fseek(f, 0, SEEK_END);
+        msg.data_size = ftell(f);
+        msg.data = malloc(msg.data_size + 24);
+        fseek(f, 0, SEEK_SET);
+        strcpy(msg.data, "patch_set 1337 urn:test ");
+        fread(msg.data + 24, msg.data_size, 1, f);
+        fclose(f);
+        protocol_parse(&msg);
+        free(msg.data);
+        exit(EXIT_SUCCESS);
+    }
+
     if (! nofork)
     {
+#ifndef _WIN32
         int pid;
         pid = fork();
         if (pid != 0)
@@ -822,6 +1265,7 @@ int main(int argc, char **argv)
             }
             exit(EXIT_SUCCESS);
         }
+#endif
     }
 
     if (mod_host_init(NULL, socket_port, feedback_port) != 0)
@@ -835,11 +1279,15 @@ int main(int argc, char **argv)
     if (interactive)
     {
         interactive_mode();
+        effects_finish(1);
         return 0;
     }
     else
 #endif
     {
+#ifdef _WIN32
+        SetConsoleCtrlHandler(win32_signal, TRUE);
+#else
         struct sigaction sig;
         memset(&sig, 0, sizeof(sig));
 
@@ -848,6 +1296,7 @@ int main(int argc, char **argv)
         sigemptyset(&sig.sa_mask);
         sigaction(SIGTERM, &sig, NULL);
         sigaction(SIGINT, &sig, NULL);
+#endif
     }
 
     /* Verbose */
@@ -876,6 +1325,9 @@ int jack_initialize(jack_client_t* client, const char* load_init)
     int socket_port = SOCKET_DEFAULT_PORT;
     int feedback_port = 0;
 
+    if (load_init == NULL || load_init[0] == '\0')
+        load_init = getenv("MOD_DEVICE_HOST_PORT");
+
     if (load_init != NULL && load_init[0] != '\0')
     {
         socket_port = atoi(load_init);
@@ -889,7 +1341,7 @@ int jack_initialize(jack_client_t* client, const char* load_init)
         return 1;
 
     running = 1;
-    pthread_create(&intclient_socket_thread, NULL, intclient_socket_run, NULL);
+    zix_thread_create(&intclient_socket_thread, 0, intclient_socket_run, NULL);
 
     return 0;
 }
@@ -901,7 +1353,7 @@ void jack_finish(void* arg)
 {
     running = 0;
     socket_finish();
-    pthread_join(intclient_socket_thread, NULL);
+    zix_thread_join(intclient_socket_thread, NULL);
     effects_finish(0);
     protocol_remove_commands();
 

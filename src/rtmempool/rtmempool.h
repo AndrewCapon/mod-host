@@ -39,14 +39,12 @@ typedef void* RtMemPool_Handle;
  *
  * <b>may/will sleep</b>
  *
- * @param poolName pool name, for debug purposes, max RTSAFE_MEMORY_POOL_NAME_MAX chars, including terminating zero char. May be NULL.
  * @param dataSize memory chunk size
  * @param maxPreallocated max chunks preallocated
  *
  * @return Success status, true if successful
  */
 bool rtsafe_memory_pool_create(RtMemPool_Handle* handlePtr,
-                               const char* poolName,
                                size_t dataSize,
                                size_t maxPreallocated);
 

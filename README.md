@@ -49,7 +49,7 @@ Dependencies:
 
 On Debian-based Linux distributions (Ubuntu, Mint, etc) most of these can be installed with:
 
-   sudo apt install libreadline-dev liblilv-dev lilv-utils libfftw3-dev libjack-jackd2-dev
+    sudo apt install libreadline-dev liblilv-dev lilv-utils libfftw3-dev libjack-jackd2-dev
 
 For Hylia, please go to https://github.com/falkTX/Hylia to install from source.
 
@@ -91,7 +91,7 @@ Options
     -i, --interactive
         interactive shell mode
 
-    -n, --nofork 
+    -n, --nofork
         run in non-forking mode
 
     -V, --version
@@ -107,33 +107,61 @@ Commands (or Protocol)
 The commands supported by mod-host are:
 
     add <lv2_uri> <instance_number>
-        * add an LV2 plugin encapsulated as a jack client
-        e.g.: add http://lv2plug.in/plugins/eg-amp 0
-        instance_number must be any value between 0 ~ 9999, inclusively
+        * add an LV2 plugin encapsulated as a jack client, in activated state
+        e.g.: add "http://lv2plug.in/plugins/eg-amp" 0
+        instance_number must be any value between 0 ~ 9990, inclusively
 
     remove <instance_number>
-        * remove an LV2 plugin instance (and also the jack client)
+        * remove an LV2 plugin instance, and also the jack client
         e.g.: remove 0
+        when instance_number is -1 all plugins will be removed
+
+    activate <instance_number> <activate_value>
+        * toggle effect activated state
+        e.g.: activate 0 1
+        if activate_value = 1 activate effect
+        if activate_value = 0 deactivate effect
+
+    preload <lv2_uri> <instance_number>
+        * add an LV2 plugin encapsulated as a jack client, in deactivated state
+        e.g.: preload "http://lv2plug.in/plugins/eg-amp" 0
+        instance_number must be any value between 0 ~ 9990, inclusively
 
     preset_load <instance_number> <preset_uri>
-        * load a preset state to given effect instance
+        * load a preset state of an effect instance
         e.g.: preset_load 0 "http://drobilla.net/plugins/mda/presets#JX10-moogcury-lite"
 
     preset_save <instance_number> <preset_name> <dir> <file_name>
-        * save a preset state from given effect instance
-        e.g.: preset_save 0 "My Preset" /home/user/.lv2/my-presets.lv2 mypreset.ttl
+        * save a preset state of an effect instance
+        e.g.: preset_save 0 "My Preset" "/home/user/.lv2/my-presets.lv2" "mypreset.ttl"
 
-    preset_show <instance_number> <preset_uri>
-        * show the preset information of requested instance / URI
-        e.g.: preset_show 0 http://drobilla.net/plugins/mda/presets#EPiano-bright
+    preset_show <preset_uri>
+        * show the preset information of requested URI
+        e.g.: preset_show "http://drobilla.net/plugins/mda/presets#EPiano-bright"
 
     connect <origin_port> <destination_port>
-        * connect two effect audio ports
-        e.g.: connect system:capture_1 effect_0:in
+        * connect two jack ports
+        e.g.: connect "system:capture_1" "effect_0:in"
+
+    connect_matching <matching_port> <destination_port>
+        * connect the same connected ports of a port to another, so they match.
+        e.g.: connect "effect_0:in" "effect_1:in"
+
+    connect_safe <origin_port> <destination_port>
+        * safely connect two jack ports, verifying that they exist beforehand
+        e.g.: connect_safe "system:capture_1" "effect_0:in"
 
     disconnect <origin_port> <destination_port>
-        * disconnect two effect audio ports
-        e.g.: disconnect system:capture_1 effect_0:in
+        * disconnect two jack ports
+        e.g.: disconnect "system:capture_1" "effect_0:in"
+
+    disconnect_all <origin_port>
+        * disconnect all connections of a jack port
+        e.g.: disconnect_all "effect_0:in"
+
+    disconnect_safe <origin_port> <destination_port>
+        * safely disconnect two jack ports, verifying that they exist and have connections beforehand
+        e.g.: disconnect_safe "system:capture_1" "effect_0:in"
 
     bypass <instance_number> <bypass_value>
         * toggle effect processing
@@ -142,69 +170,98 @@ The commands supported by mod-host are:
         if bypass_value = 0 process effect
 
     param_set <instance_number> <param_symbol> <param_value>
-        * set a value to given control
-        e.g.: param_set 0 gain 2.50
+        * set the value of a control port
+        e.g.: param_set 0 "gain" 2.5
 
     param_get <instance_number> <param_symbol>
-        * get the value of the request control
-        e.g.: param_get 0 gain
+        * get the value of a control port
+        e.g.: param_get 0 "gain"
 
     param_monitor <instance_number> <param_symbol> <cond_op> <value>
-        * do monitoring a effect instance control port according given condition
-        e.g: param_monitor 0 gain > 2.50
+        * monitor a control port according to a condition
+        e.g: param_monitor 0 "gain" ">" 2.5
+
+    params_flush <instance_number> <reset_value> <param_count> <params...>
+        * flush several param values at once and trigger reset if available
+        * reset value must be according to reset property spec
+        e.g.: params_flush 0 1 2 "gain" 0.0 "distortion" 0.5
+
+    patch_set <instance_number> <property_uri> <value>
+        * set the value of a control port
+        e.g.: patch_set 0 "gain" 2.5
+
+    patch_get <instance_number> <property_uri>
+        * get the value of a control port
+        e.g.: patch_get 0 "gain"
 
     licensee <instance_number>
         * get the licensee name for a commercial plugin
         e.g.: licensee 0
 
     monitor <addr> <port> <status>
-        * open a socket port to monitoring parameters
+        * open a socket port for monitoring parameter changes
         e.g: monitor localhost 12345 1
         if status = 1 start monitoring
         if status = 0 stop monitoring
 
     monitor_output <instance_number> <param_symbol>
-        * request monitoring of an output control port in the feedback port
-        e.g.: monitor_output 0 meter
+        * request monitoring of an output control port (on the feedback port)
+        e.g.: monitor_output 0 "meter"
+
+    monitor_output_off <instance_number> <param_symbol>
+        * turn off monitoring of an output control port (on the feedback port)
+        e.g.: monitor_output_off 0 "meter"
 
     midi_learn <instance_number> <param_symbol> <minimum> <maximum>
-        * start MIDI learn for a parameter
-        e.g.: midi_learn 0 gain 0.0 1.0
+        * start MIDI learn for a control port
+        e.g.: midi_learn 0 "gain" 0.0 1.0
 
     midi_map <instance_number> <param_symbol> <midi_channel> <midi_cc> <minimum> <maximum>
-        * map a MIDI controller to a parameter
-        e.g.: midi_map 0 gain 0 7 0.0 1.0
+        * map a MIDI controller to a control port
+        e.g.: midi_map 0 "gain" 0 7 0.0 1.0
+        a non-standard midi_cc value of 131 (0x83) is used for pitchbend
 
     midi_unmap <instance_number> <param_symbol>
-        * unmap the MIDI controller from a parameter
-        e.g.: unmap 0 gain
+        * unmap the MIDI controller from a control port
+        e.g.: midi_unmap 0 "gain"
 
-    set_midi_program_change_pedalboard_bank_channel <enable> <midi_channel>
-        * set the MIDI channel which changes pedalboard banks on MIDI program change. <midi_channel> is in the range of [0,15].
-        e.g.: set_midi_program_change_pedalboard_bank_channel 1 5 to enable listening for bank changes on channel 6
+    monitor_audio_levels <source_port_name> <enable>
+        * monitor audio levels for a specific jack port (on the feedback port)
+        e.g.: monitor_audio_levels "system:capture_1" 1
 
-    set_midi_program_change_pedalboard_snapshot_channel <enable> <midi_channel>
-        * set the MIDI channel which changes pedalboard snapshots on MIDI program change. <midi_channel> is in the range of [0,15].
-        e.g.: set_midi_program_change_pedalboard_snapshot_channel 1 4 to enable listening for preset changes on channel 5
+    monitor_midi_control <midi_channel> <enable>
+        * listen to MIDI control change messages (on the feedback port)
+        e.g.: monitor_midi_control 7 1
 
-    cc_map <instance_number> <param_symbol> <device_id> <actuator_id> <label> <value> <minimum> <maximum> <steps> <unit> <scalepoints_count> <scalepoints...>
-        * map a Control Chain actuator to a parameter
-        e.g.: cc_map 0 gain 0 1 "Gain" 0.0 -24.0 3.0 33 "dB" 0
+    monitor_midi_program <midi_channel> <enable>
+        * listen to MIDI program change messages (on the feedback port)
+        e.g.: monitor_midi_program 0 1
+
+    cc_map <instance_number> <param_symbol> <device_id> <actuator_id> <label> <value> <minimum> <maximum> <steps> <extraflags> <unit> <scalepoints_count> <scalepoints...>
+        * map a Control Chain actuator to a control port
+        e.g.: cc_map 0 "gain" 0 1 "Gain" 0.0 -24.0 3.0 33 0 "dB" 0
 
     cc_unmap <instance_number> <param_symbol>
-        * unmap the Control Chain actuator from a parameter
-        e.g.: unmap 0 gain
+        * unmap the Control Chain actuator from a control port
+        e.g.: cc_unmap 0 "gain"
+
+    cc_value_set <instance_number> <param_symbol> <value>
+        * set the value of a  mapped Control Chain actuator
+        e.g.: cc_value_set 0 "gain" 2.5
 
     cv_map <instance_number> <param_symbol> <source_port_name> <minimum> <maximum> <operational-mode>
-        * map a CV source port to a parameter, operational-mode being one of '-', '+', 'b' or '='
-        e.g.: cv_map 0 gain "AMS CV Source:CV Out 1" -24.0 3.0 =
+        * map a CV source port to a control port, operational-mode being one of '-', '+', 'b' or '='
+        e.g.: cv_map 0 "gain" "AMS CV Source:CV Out 1" -24.0 3.0 =
 
     cv_unmap <instance_number> <param_symbol>
-        * unmap the CV source port actuator from a parameter
-        e.g.: cv_unmap 0 gain
+        * unmap the CV source port actuator from a control port
+        e.g.: cv_unmap 0 "gain"
 
     cpu_load
-        * return current jack cpu load
+        * return current average jack cpu load
+
+    max_cpu_load
+        * return current maximum jack cpu load
 
     load <file_name>
         * load a history command file
@@ -218,23 +275,73 @@ The commands supported by mod-host are:
 
     bundle_add <bundle_path>
         * add a bundle to the running lv2 world
-        e.g.: bundle_add /path/to/bundle.lv2
+        e.g.: bundle_add "/path/to/bundle.lv2"
 
-    bundle_remove <bundle_path>
+    bundle_remove <bundle_path> <resource>
         * remove a bundle from the running lv2 world
-        e.g.: bundle_remove /path/to/bundle.lv2
+        e.g.: bundle_remove "/path/to/bundle.lv2" ""
 
     feature_enable <feature> <enable>
         * enable or disable a feature
+        * feature can be one of "aggregated-midi", "freewheeling" or "processing"
+        * the "aggregated-midi" feature requires the use of jack2 and mod-midi-merger to be installed system-wide
         e.g.: feature_enable link 1
-        current features are "link", "processing" and "midi_clock_slave"
+
+    set_bpm <beats_per_minute>
+        * set the global beats per minute transport value
+        e.g.: set_bpm 120
+
+    set_bpb <beats_per_bar>
+        * set the global beats per bar transport value
+        e.g.: set_bpb 4
 
     transport <rolling> <beats_per_bar> <beats_per_minute>
-        * change the current transport state
+        * change the global transport state
         e.g.: transport 1 4 120
+
+    transport_sync <mode>
+        * change the transport sync mode
+        * mode can be one of "none", "link" or "midi"
+        e.g.: transport_sync "midi"
 
     output_data_ready
         * report feedback port ready for more messages
+
+    multi_add <instance_count> <lv2_uri,instance_number...>
+        * add an LV2 plugin encapsulated as a jack client, in activated state (multiple instance variant)
+        e.g.: multi_add 2 "http://lv2plug.in/plugins/eg-amp" 0 "http://lv2plug.in/plugins/eg-amp" 1
+        instance_number must be any value between 0 ~ 9990, inclusively
+
+    multi_remove <instance_count> <instance_number...>
+        * remove an LV2 plugin instance, and also the jack client (multiple instance variant)
+        e.g.: multi_remove 2 0 1
+
+    multi_activate <activate_value> <instance_count> <instance_number...>
+        * toggle effect activated state (multiple instance variant)
+        e.g.: multi_activate 0 2 0 1
+        if activate_value = 1 activate effect
+        if activate_value = 0 deactivate effect
+
+    multi_preload <instance_count> <lv2_uri,instance_number...>
+        * add an LV2 plugin encapsulated as a jack client, in deactivated state (multiple instance variant)
+        e.g.: multi_preload 2 "http://lv2plug.in/plugins/eg-amp" 0 "http://lv2plug.in/plugins/eg-amp" 1
+        instance_number must be any value between 0 ~ 9990, inclusively
+
+    multi_bypass <bypass_value> <instance_count> <instance_number...>
+        * toggle effect processing (multiple instance variant)
+        e.g.: multi_bypass 0 2 0 1
+        if bypass_value = 1 bypass effect
+        if bypass_value = 0 process effect
+
+    multi_param_set <param_symbol> <param_value> <instance_count> <instance_number...>
+        * set the value of a control port (multiple instance variant)
+        * must be instances of the same plugin
+        e.g.: multi_param_set "gain" 2.5 2 0 1
+
+    multi_params_flush <reset_value> <instance_count> <instance_number...> <param_count> <params...>
+        * flush several param values at once and trigger reset if available (multiple instance variant)
+        * reset value must be according to reset property spec
+        e.g.: multi_params_flush 1 2 0 1 2 "gain" 0.0 "distortion" 0.5
 
     help
         * show a help message
@@ -268,12 +375,16 @@ If status is a negative number an error has occurred. The table below shows the 
 | -204    | ERR\_JACK\_PORT\_REGISTER        |
 | -205    | ERR\_JACK\_PORT\_CONNECTION      |
 | -206    | ERR\_JACK\_PORT\_DISCONNECTION   |
+| -207    | ERR\_JACK\_VALUE\_OUT\_OF\_RANGE |
 | -301    | ERR\_ASSIGNMENT\_ALREADY\_EXISTS |
 | -302    | ERR\_ASSIGNMENT\_INVALID\_OP     |
 | -303    | ERR\_ASSIGNMENT\_LIST\_FULL      |
 | -304    | ERR\_ASSIGNMENT\_FAILED          |
+| -304    | ERR\_ASSIGNMENT\_UNUSED          |
 | -401    | ERR\_CONTROL\_CHAIN\_UNAVAILABLE |
 | -402    | ERR\_LINK\_UNAVAILABLE           |
+| -403    | ERR\_HMI\_UNAVAILABLE            |
+| -404    | ERR\_EXTERNAL\_UI\_UNAVAILABLE   |
 | -901    | ERR\_MEMORY\_ALLOCATION          |
 | -902    | ERR\_INVALID\_OPERATION          |
 

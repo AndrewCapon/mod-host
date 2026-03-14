@@ -1,5 +1,6 @@
 /*
   Copyright 2007-2012 David Robillard <http://drobilla.net>
+  Copyright 2016-2026 Filipe Coelho <falktx@falktx.com>
 
   Permission to use, copy, modify, and/or distribute this software for any
   purpose with or without fee is hereby granted, provided that the above
@@ -15,7 +16,7 @@
 */
 
 #include <lilv/lilv.h>
-#include <lv2/lv2plug.in/ns/ext/worker/worker.h>
+#include <lv2/worker/worker.h>
 #include <jack/ringbuffer.h>
 
 #include "mod-semaphore.h"
@@ -33,7 +34,7 @@ typedef struct WORKER_T {
 } worker_t;
 
 
-void worker_init(worker_t *worker, LilvInstance *instance, const LV2_Worker_Interface *iface);
+void worker_init(worker_t *worker, LilvInstance *instance, const LV2_Worker_Interface *iface, uint32_t size);
 void worker_finish(worker_t *worker);
 LV2_Worker_Status worker_schedule(LV2_Worker_Schedule_Handle handle, uint32_t size, const void *data);
 void worker_emit_responses(worker_t *worker);
