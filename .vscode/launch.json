@@ -36,10 +36,11 @@
         },
         {
             "name": "(gdb) Local debug",
+            "preLaunchTask": "make mod-host",
             "type": "cppdbg",
             "request": "launch",
             "program": "mod-host",
-            "args": ["-n", "-p 5555", "-f 5556"],
+            "args": ["-v", "-n", "-p 5555", "-f 5556"],
             "stopAtEntry": false,
             "cwd": "/home/andrewcapon/MOD/mod-host/",
             "environment": [],
