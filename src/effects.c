@@ -2666,6 +2666,10 @@ static bool SetPortValue(port_t *port, float value, int effect_id, bool is_bypas
     if (update_transport)
         return UpdateGlobalJackPosition(UPDATE_POSITION_FORCED, false);
 
+    // if we have midi feedback enabled nd the source is CV then sen out midi
+    if(g_enable_midi_feedback &&  NULL != port->cv_source)
+        effects_send_midi_feedback(effect_id, (const char *)port->symbol);
+
     return true;
 }
 
@@ -7103,6 +7107,8 @@ int effects_disconnect_all(const char *port)
 
 void effects_send_midi_feedback(int effect_id, const char *control_symbol)
 {
+    // TODO : we really should change the way this is all stored
+    //        this code is all rather expensive and there is loads of it everywhere
     for (int j = 0; j < MAX_MIDI_CC_ASSIGN; j++)
     {
         if (g_midi_cc_list[j].effect_id == ASSIGNMENT_NULL)
@@ -7133,7 +7139,7 @@ int effects_set_parameter(int effect_id, const char *control_symbol, float value
 #ifdef WITH_EXTERNAL_UI_SUPPORT
     static enum PortHints *last_hints;
 #endif
-
+    
     if (InstanceExist(effect_id))
     {
         // check whether is setting the same parameter
@@ -8713,6 +8719,8 @@ int effects_cv_map(int effect_id, const char *control_symbol, const char *source
             char *value_max = NULL;
 
             // get values from jack metadata
+#ifdef __MOD_DEVICES__      
+            // disabled on linux as causing seg fault
             if (jack_get_property(uuid, LV2_CORE__minimum, &value_min, NULL) == 0 &&
                 jack_get_property(uuid, LV2_CORE__maximum, &value_max, NULL) == 0)
             {
@@ -8724,7 +8732,9 @@ int effects_cv_map(int effect_id, const char *control_symbol, const char *source
 
             // find values when client is from mod-host, as fallback
             }
-            else if (!strncmp(source_port_name, "effect_", 7))
+            else 
+#endif            
+            if (!strncmp(source_port_name, "effect_", 7))
             {
                 char effect_str[6];
                 const char *source_symbol = NULL;
