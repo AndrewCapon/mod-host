@@ -936,7 +936,7 @@ static void* PostPonedEventsThread(void* arg);
 static void* HMIClientThread(void* arg);
 #endif
 static int ProcessPlugin(jack_nframes_t nframes, void *arg);
-static bool SetPortValue(port_t *port, float value, int effect_id, bool is_bypass, bool from_ui);
+static bool SetPortValue(port_t *port, float value, int effect_id, bool is_bypass, bool from_ui, bool update_midi);
 static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres);
 static bool UpdateGlobalJackPosition(enum UpdatePositionFlag flag, bool do_post);
 static int ProcessGlobalClient(jack_nframes_t nframes, void *arg);
@@ -2270,7 +2270,7 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
                 continue;
             }
 
-            if (SetPortValue(port, value, effect->instance, false, false)) {
+            if (SetPortValue(port, value, effect->instance, false, false, true)) {
                 needs_post = true;
                 cv_source->prev_value = value;
             }
@@ -2304,7 +2304,7 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
 
             // ignore requests for same value
             if (floats_differ_enough(cv_source->prev_value, value)) {
-                if (SetPortValue(port, value, effect->instance, true, false)) {
+                if (SetPortValue(port, value, effect->instance, true, false, true)) {
                     needs_post = true;
                     cv_source->prev_value = value;
                 }
@@ -2602,7 +2602,7 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
     return 0;
 }
 
-static bool SetPortValue(port_t *port, float value, int effect_id, bool is_bypass, bool from_ui)
+static bool SetPortValue(port_t *port, float value, int effect_id, bool is_bypass, bool from_ui, bool update_midi)
 {
     bool update_transport = false;
 
@@ -2666,9 +2666,18 @@ static bool SetPortValue(port_t *port, float value, int effect_id, bool is_bypas
     if (update_transport)
         return UpdateGlobalJackPosition(UPDATE_POSITION_FORCED, false);
 
-    // if we have midi feedback enabled nd the source is CV then sen out midi
-    if(g_enable_midi_feedback &&  NULL != port->cv_source)
-        effects_send_midi_feedback(effect_id, (const char *)port->symbol);
+    // if we have midi feedback enabled and upate_midi is true send midi out
+    if(g_enable_midi_feedback)
+    { 
+        if(update_midi) {
+            if (g_verbose_debug)
+                printf("DEBUG: SetPortValue() sending midi\n");
+                
+            effects_send_midi_feedback(effect_id, (const char *)port->symbol);
+        }
+        else if (g_verbose_debug) 
+            printf("DEBUG: SetPortValue() not sending midi\n");
+    }
 
     return true;
 }
@@ -4329,7 +4338,7 @@ static LV2_ControlInputPort_Change_Status RequestControlPortChange(LV2_ControlIn
     if (!floats_differ_enough(port->prev_value, value))
         return LV2_CONTROL_INPUT_PORT_CHANGE_SUCCESS;
 
-    if (SetPortValue(port, value, effect->instance, false, false))
+    if (SetPortValue(port, value, effect->instance, false, false, false))
         sem_post(&g_postevents_semaphore);
 
     return LV2_CONTROL_INPUT_PORT_CHANGE_SUCCESS;
@@ -4443,7 +4452,7 @@ static void CCDataUpdate(void* arg)
             continue;
         }
 
-        if (SetPortValue(assignment->port, data->value, assignment->effect_id, is_bypass, false))
+        if (SetPortValue(assignment->port, data->value, assignment->effect_id, is_bypass, false, true))
             needs_post = true;
     }
 
@@ -4521,6 +4530,7 @@ static bool CheckCCDeviceProtocolVersion(int device_id, int major, int minor)
     const int device_minor = atoi(buf_minor);
 
     free(descriptor);
+    printf("DEBUG: CheckCCDeviceProtocolVersion(%d,%d) got %d, %d\n", major, minor, device_major, device_minor);
     return device_major >= major && device_minor >= minor;
 
 free:
@@ -4569,7 +4579,7 @@ static void ExternalControllerWriteFunction(LV2UI_Controller controller,
     if (!floats_differ_enough(port->prev_value, value))
         return;
 
-    if (SetPortValue(port, value, effect->instance, false, true))
+    if (SetPortValue(port, value, effect->instance, false, true, false))
         sem_post(&g_postevents_semaphore);
 }
 #endif
@@ -4579,7 +4589,7 @@ static void ExternalControllerWriteFunction(LV2UI_Controller controller,
 *           GLOBAL FUNCTIONS
 ************************************************************************************************************************
 */
-
+extern char **environ;
 int effects_init(void* client)
 {
     /* This global client is for connections / disconnections and midi-learn */
@@ -4610,11 +4620,11 @@ int effects_init(void* client)
 	
     // check midi feedback mode 
     // ENABLE_MIDI_FEEDBACK==0 Turn midi feedback off
-    // ENABLE_MIDI_FEEDBACK==1 Turn midi feedback on with no sync for multiple devices
+    // ENABLE_MIDI_FEEDBACK==1 Turn midi feedback on with no sync for multiple devices (default if no env var exists)
     // ENABLE_MIDI_FEEDBACK==2 Turn midi feedback on with sync for multiple devices
     const char* const enable_midi_feedback = getenv("ENABLE_MIDI_FEEDBACK");
     g_enable_midi_feedback      = enable_midi_feedback == NULL || atoi(enable_midi_feedback) != 0; 
-    g_enable_midi_feedback_sync = enable_midi_feedback == NULL || atoi(enable_midi_feedback) == 2;
+    g_enable_midi_feedback_sync = enable_midi_feedback != NULL && atoi(enable_midi_feedback) == 2;
 
     // setup nrpn mode
     // ENABLE_MIDI_FEEDBACK==0 Turn NRPN off
@@ -8989,6 +8999,7 @@ int effects_hmi_map(int effect_id, const char *control_symbol, int hw_id, int pa
 int effects_hmi_unmap(int effect_id, const char *control_symbol)
 {
 #ifdef MOD_HMI_CONTROL_ENABLED
+shit
     if (!InstanceExist(effect_id))
         return ERR_INSTANCE_NON_EXISTS;
 
