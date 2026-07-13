@@ -1,3 +1,6 @@
+DEBUG=1
+MOD_HMI_EMULATION=1
+
 # compiler
 CC ?= gcc
 
@@ -28,6 +31,10 @@ ifeq ($(DEBUG), 1)
 else
    CFLAGS += -fvisibility=hidden
    LDFLAGS += -s
+endif
+
+ifeq ($(MOD_HMI_EMULATION), 1)
+	CFLAGS += -D_MOD_HMI_EMULATION
 endif
 
 ifeq ($(TESTBUILD), 1)

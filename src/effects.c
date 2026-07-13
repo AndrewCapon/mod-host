@@ -162,6 +162,11 @@ typedef struct {
 #define MOD_IO_PROCESSING_ENABLED
 #endif
 
+#if defined(_MOD_HMI_EMULATION)
+#define MOD_HMI_CONTROL_ENABLED
+#define __MOD_DEVICES__
+#endif
+
 #ifdef _DARKGLASS_DEVICE_PABLITO
 #define _DARKGLASS_PABLITO
 #endif
@@ -4627,8 +4632,8 @@ int effects_init(void* client)
     g_enable_midi_feedback_sync = enable_midi_feedback != NULL && atoi(enable_midi_feedback) == 2;
 
     // setup nrpn mode
-    // ENABLE_MIDI_FEEDBACK==0 Turn NRPN off
-    // ENABLE_MIDI_FEEDBACK==1 Turn NRPN on
+    // ENABLE_MIDI_NRPN==0 Turn NRPN off
+    // ENABLE_MIDI_NRPN==1 Turn NRPN on
     const char* const enable_nrpn = getenv("ENABLE_MIDI_NRPN");
     g_enable_nrpn = enable_nrpn == NULL || atoi(enable_nrpn) != 0;
 
@@ -8999,7 +9004,6 @@ int effects_hmi_map(int effect_id, const char *control_symbol, int hw_id, int pa
 int effects_hmi_unmap(int effect_id, const char *control_symbol)
 {
 #ifdef MOD_HMI_CONTROL_ENABLED
-shit
     if (!InstanceExist(effect_id))
         return ERR_INSTANCE_NON_EXISTS;
 

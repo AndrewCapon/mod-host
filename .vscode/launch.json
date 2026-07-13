@@ -8,17 +8,15 @@
             "name": "(gdb) Dwarf Debug",
             "type": "cppdbg",
             "request": "launch",
-            "preLaunchTask": "start gdb server", 
+            // "preLaunchTask": "start gdb server", 
             "program": "${workspaceFolder}/mod-host.so",
             "MIMode": "gdb",
             "miDebuggerPath": "/usr/bin/gdb-multiarch",
-            // Leave miDebuggerServerAddress OUT entirely. Leaving it in triggers VS Code's broken automatic launch sequence.
             "cwd": "${workspaceFolder}",
             "targetArchitecture": "arm",
             "logging": {
                 "engineLogging": true
             },
-            // This block completely overrides VS Code's default boot commands and runs your CLI commands instead:
             "customLaunchSetupCommands": [
                 {
                     "description": "Set sysroot",
@@ -39,11 +37,11 @@
             "preLaunchTask": "make mod-host",
             "type": "cppdbg",
             "request": "launch",
-            "program": "mod-host",
+            "program": "/home/andrewcapon/MOD/mod-host/mod-host",
             "args": ["-v", "-n", "-p 5555", "-f 5556"],
             "stopAtEntry": false,
             "cwd": "/home/andrewcapon/MOD/mod-host/",
-            "environment": [],
+            "environment": [{"name":"MOD_LOG", "value":"1"}, {"name":"ENABLE_MIDI_NRPN", "value":"0"}],
             "externalConsole": false,
             "MIMode": "gdb",
             "setupCommands": [
