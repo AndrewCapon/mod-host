@@ -3818,7 +3818,7 @@ static void ConnectToAllHardwareMIDIPorts(void)
         jack_free(midihwports);
     }
 
-}
+ }
 
 static void ConnectToMIDIThroughPorts(void)
 {
@@ -5101,6 +5101,18 @@ int effects_init(void* client)
     {
         ConnectToAllHardwareMIDIPorts();
     }
+
+    // enable midi feedback, sync and nrpn
+    if(access("/data/midi-feedback", F_OK) != -1) 
+        effects_midi_feedback_enable(true);
+
+    if(access("/data/midi-feedback-sync", F_OK) != -1) 
+        effects_midi_feedback_sync_enable(true);
+    
+    if(access("/data/midi-nrpn", F_OK) != -1) 
+        effects_midi_nrpn_enable(true);
+    
+
 
 #ifdef MOD_IO_PROCESSING_ENABLED
     /* Connect to capture ports if avaiable */
@@ -9490,10 +9502,10 @@ int effects_midi_feedback_enable(int enable)
     {
         g_enable_midi_feedback = enable != 0;
         
-        if(g_enable_midi_feedback) // TODO MIDI_FEEDBACK - need to be able to turn off
+        if(g_enable_midi_feedback) 
         {
             // turn on
-            g_midi_out_port = jack_port_register(g_jack_global_client, "midi_out", JACK_DEFAULT_MIDI_TYPE, JackPortIsOutput, 0);
+            g_midi_out_port = jack_port_register(g_jack_global_client, "midi_out", JACK_DEFAULT_MIDI_TYPE, JackPortIsOutput, 0); 
 
             if (! g_midi_out_port)
             {
@@ -9504,36 +9516,40 @@ int effects_midi_feedback_enable(int enable)
             }
             else
             {
-                const char** const midihwports = jack_get_ports(g_jack_global_client, "",
-                                                                JACK_DEFAULT_MIDI_TYPE,
-                                                                JackPortIsTerminal|JackPortIsPhysical|JackPortIsInput);
-                if (midihwports != NULL)
+                // only if mod-midi-merger does not exist
+                if(jack_port_by_name(g_jack_global_client, "mod-midi-merger:out") == NULL)
                 {
-                    const char *ourportname = jack_port_name(g_midi_out_port);
-
-                    char  aliases[2][320];
-                    char* aliasesptr[2] = {
-                        aliases[0],
-                        aliases[1]
-                    };
-
-                    for (int i=0; midihwports[i] != NULL; ++i)
+                    const char** const midihwports = jack_get_ports(g_jack_global_client, "",
+                                                                    JACK_DEFAULT_MIDI_TYPE,
+                                                                    JackPortIsTerminal|JackPortIsPhysical|JackPortIsInput);
+                    if (midihwports != NULL)
                     {
-                        jack_port_t* const port = jack_port_by_name(g_jack_global_client, midihwports[i]);
+                        const char *ourportname = jack_port_name(g_midi_out_port);
 
-                        if (port == NULL)
-                            continue;
+                        char  aliases[2][320];
+                        char* aliasesptr[2] = {
+                            aliases[0],
+                            aliases[1]
+                        };
 
-                        if (jack_port_get_aliases(port, aliasesptr) > 0)
+                        for (int i=0; midihwports[i] != NULL; ++i)
                         {
-                            if (strncmp(aliases[0], "alsa_pcm:Midi-Through/", 22) == 0)
+                            jack_port_t* const port = jack_port_by_name(g_jack_global_client, midihwports[i]);
+
+                            if (port == NULL)
                                 continue;
+
+                            if (jack_port_get_aliases(port, aliasesptr) > 0)
+                            {
+                                if (strncmp(aliases[0], "alsa_pcm:Midi-Through/", 22) == 0)
+                                    continue;
+                            }
+
+                            jack_connect(g_jack_global_client, ourportname, midihwports[i]);
                         }
 
-                        jack_connect(g_jack_global_client, ourportname, midihwports[i]);
+                        jack_free(midihwports);
                     }
-
-                    jack_free(midihwports);
                 }
             }
         }
