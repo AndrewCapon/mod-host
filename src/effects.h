@@ -212,6 +212,7 @@ void effect_sync_scheduled_params(int realtime);
 void effects_output_data_ready(void);
 int effects_show_external_ui(int effect_id);
 void effects_idle_external_uis(void);
+void effects_midi_feedback_connect_hw_ports(void);
 
 /*
 ************************************************************************************************************************
