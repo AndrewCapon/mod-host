@@ -936,7 +936,7 @@ static void* PostPonedEventsThread(void* arg);
 static void* HMIClientThread(void* arg);
 #endif
 static int ProcessPlugin(jack_nframes_t nframes, void *arg);
-static bool SetPortValue(port_t *port, float value, int effect_id, bool is_bypass, bool from_ui);
+static bool SetPortValue(port_t *port, float value, int effect_id, bool is_bypass, bool from_ui, bool update_midi);
 static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres);
 static bool UpdateGlobalJackPosition(enum UpdatePositionFlag flag, bool do_post);
 static int ProcessGlobalClient(jack_nframes_t nframes, void *arg);
@@ -2269,7 +2269,7 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
                 continue;
             }
 
-            if (SetPortValue(port, value, effect->instance, false, false)) {
+            if (SetPortValue(port, value, effect->instance, false, false, true)) {
                 needs_post = true;
                 cv_source->prev_value = value;
             }
@@ -2303,7 +2303,7 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
 
             // ignore requests for same value
             if (floats_differ_enough(cv_source->prev_value, value)) {
-                if (SetPortValue(port, value, effect->instance, true, false)) {
+                if (SetPortValue(port, value, effect->instance, true, false, true)) {
                     needs_post = true;
                     cv_source->prev_value = value;
                 }
@@ -2601,7 +2601,7 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
     return 0;
 }
 
-static bool SetPortValue(port_t *port, float value, int effect_id, bool is_bypass, bool from_ui)
+static bool SetPortValue(port_t *port, float value, int effect_id, bool is_bypass, bool from_ui, bool update_midi)
 {
     bool update_transport = false;
 
@@ -2664,6 +2664,19 @@ static bool SetPortValue(port_t *port, float value, int effect_id, bool is_bypas
 
     if (update_transport)
         return UpdateGlobalJackPosition(UPDATE_POSITION_FORCED, false);
+
+    // if we have midi feedback enabled and upate_midi is true send midi out
+    if(g_enable_midi_feedback)
+    { 
+        if(update_midi) {
+            if (g_verbose_debug)
+                printf("DEBUG: SetPortValue() sending midi\n");
+                
+            effects_send_midi_feedback(effect_id, (const char *)port->symbol);
+        }
+        else if (g_verbose_debug) 
+            printf("DEBUG: SetPortValue() not sending midi\n");
+    }
 
     return true;
 }
@@ -4292,7 +4305,7 @@ static LV2_ControlInputPort_Change_Status RequestControlPortChange(LV2_ControlIn
     if (!floats_differ_enough(port->prev_value, value))
         return LV2_CONTROL_INPUT_PORT_CHANGE_SUCCESS;
 
-    if (SetPortValue(port, value, effect->instance, false, false))
+    if (SetPortValue(port, value, effect->instance, false, false, false))
         sem_post(&g_postevents_semaphore);
 
     return LV2_CONTROL_INPUT_PORT_CHANGE_SUCCESS;
@@ -4406,7 +4419,7 @@ static void CCDataUpdate(void* arg)
             continue;
         }
 
-        if (SetPortValue(assignment->port, data->value, assignment->effect_id, is_bypass, false))
+        if (SetPortValue(assignment->port, data->value, assignment->effect_id, is_bypass, false, true))
             needs_post = true;
     }
 
@@ -4532,7 +4545,7 @@ static void ExternalControllerWriteFunction(LV2UI_Controller controller,
     if (!floats_differ_enough(port->prev_value, value))
         return;
 
-    if (SetPortValue(port, value, effect->instance, false, true))
+    if (SetPortValue(port, value, effect->instance, false, true, false))
         sem_post(&g_postevents_semaphore);
 }
 #endif
@@ -7058,6 +7071,8 @@ int effects_disconnect_all(const char *port)
 
 void effects_send_midi_feedback(int effect_id, const char *control_symbol)
 {
+    // TODO : we really should change the way this is all stored
+    //        this code is all rather expensive and there is loads of it everywhere
     for (int j = 0; j < MAX_MIDI_CC_ASSIGN; j++)
     {
         if (g_midi_cc_list[j].effect_id == ASSIGNMENT_NULL)
