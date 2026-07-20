@@ -811,6 +811,8 @@ static bool g_verbose_debug;
 static bool g_enable_midi_feedback;
 static bool g_enable_midi_feedback_sync;
 static bool g_enable_nrpn;
+static bool g_enable_multiple_controllers;
+
 
 static uint16_t  g_nrpn_param_num;
 static uint16_t  g_nrpn_param_value;
@@ -2666,7 +2668,7 @@ static bool SetPortValue(port_t *port, float value, int effect_id, bool is_bypas
         return UpdateGlobalJackPosition(UPDATE_POSITION_FORCED, false);
 
     // if we have midi feedback enabled and upate_midi is true send midi out
-    if(g_enable_midi_feedback)
+    if(g_enable_multiple_controllers && g_enable_midi_feedback)
     { 
         if(update_midi) {
             if (g_verbose_debug)
@@ -4589,7 +4591,7 @@ int effects_init(void* client)
     g_enable_midi_feedback = false;
     g_enable_midi_feedback_sync = false;
     g_enable_nrpn = false;
-
+    g_enable_multiple_controllers = false;
     
     // setup nrpn 
     g_nrpn_param_num   = 0xC000; // top two bits signify that msb and lsb need setting
@@ -5120,6 +5122,8 @@ int effects_init(void* client)
     if(access("/data/midi-nrpn", F_OK) != -1) 
         effects_midi_nrpn_enable(true);
     
+    if(access("/data/multiple-controllers", F_OK) != -1) 
+        effects_multiple_controllers_enable(true);
 
 
 #ifdef MOD_IO_PROCESSING_ENABLED
@@ -9596,6 +9600,12 @@ int effects_midi_feedback_sync_enable(int enable)
 int effects_midi_nrpn_enable(int enable) 
 {
     g_enable_nrpn = enable != 0;
+    return SUCCESS;
+}
+
+int effects_multiple_controllers_enable(int enable) 
+{
+    g_enable_multiple_controllers = enable != 0;
     return SUCCESS;
 }
 

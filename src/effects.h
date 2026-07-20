@@ -203,6 +203,7 @@ int effects_processing_enable(int enable);
 int effects_midi_feedback_enable(int enable);
 int effects_midi_feedback_sync_enable(int enable);
 int effects_midi_nrpn_enable(int enable);
+int effects_multiple_controllers_enable(int enable); 
 int effects_monitor_audio_levels(const char *source_port_name, int enable);
 int effects_monitor_midi_control(int channel, int enable);
 int effects_monitor_midi_program(int channel, int enable);
@@ -213,6 +214,7 @@ void effects_output_data_ready(void);
 int effects_show_external_ui(int effect_id);
 void effects_idle_external_uis(void);
 void effects_midi_feedback_connect_hw_ports(void);
+void effects_send_midi_feedback(int effect_id, const char *control_symbol);
 
 /*
 ************************************************************************************************************************
