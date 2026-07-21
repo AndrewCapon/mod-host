@@ -8687,8 +8687,17 @@ int effects_cv_map(int effect_id, const char *control_symbol, const char *source
             char *value_max = NULL;
 
             // get values from jack metadata
+#ifdef __MOD_DEVICES__ 
             if (jack_get_property(uuid, LV2_CORE__minimum, &value_min, NULL) == 0 &&
                 jack_get_property(uuid, LV2_CORE__maximum, &value_max, NULL) == 0)
+#else        
+            // passing NULL for type is seg faulting here on ubuntu so pass type vars in
+            char *type_min = NULL;
+            char *type_max = NULL;
+
+            if (jack_get_property(uuid, LV2_CORE__minimum, &value_min, &type_min) == 0 &&
+                jack_get_property(uuid, LV2_CORE__maximum, &value_max, &type_max) == 0)
+#endif
             {
                 source_has_ranges = true;
                 source_min_value = atof(value_min);
