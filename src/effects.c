@@ -8116,6 +8116,7 @@ int effects_midi_map(int effect_id, const char *control_symbol, int channel, int
     }
 
     const bool is_bypass = !strcmp(control_symbol, g_bypass_port_symbol);
+    const bool is_preset = !strcmp(control_symbol, g_presets_port_symbol);
 
     // update current mapping first if it exists
     for (int i = 0; i < MAX_MIDI_CC_ASSIGN; i++)
@@ -8167,6 +8168,11 @@ int effects_midi_map(int effect_id, const char *control_symbol, int channel, int
             g_midi_cc_list[i].maximum = maximum;
             g_midi_cc_list[i].symbol = port->symbol;
             g_midi_cc_list[i].port = port;
+
+            if(is_preset) {
+                port->min_value = minimum;
+                port->max_value = maximum;
+            }
 
             // if midi feedback is enabled set this cc to be sent
             if(g_enable_midi_feedback)
