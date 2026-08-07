@@ -6157,7 +6157,7 @@ int effects_add(const char *uri, int instance, int activate)
     effect->presets_port.buffer_count = 1;
     effect->presets_port.buffer = &effect->preset_value;
     effect->presets_port.min_value = 0.0f;
-    effect->presets_port.max_value = 1.0f;
+    effect->presets_port.max_value = 126.0f;
     effect->presets_port.def_value = 0.0f;
     effect->presets_port.prev_value = 0.0f;
     effect->presets_port.type = TYPE_CONTROL;
@@ -7107,6 +7107,8 @@ int effects_set_parameter(int effect_id, const char *control_symbol, float value
 #ifdef WITH_EXTERNAL_UI_SUPPORT
     static enum PortHints *last_hints;
 #endif
+    if(control_symbol && control_symbol[0]==':')
+        printf("srgg");
 
     if (InstanceExist(effect_id))
     {
@@ -7135,6 +7137,9 @@ int effects_set_parameter(int effect_id, const char *control_symbol, float value
         port = FindEffectInputPortBySymbol(&(g_effects[effect_id]), control_symbol);
         if (port)
         {
+            if (g_enable_multiple_controllers) {
+                
+            }
             // stores the data of the current control
             last_effect_id = effect_id;
             last_min = port->min_value;
