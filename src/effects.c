@@ -641,7 +641,7 @@ typedef struct POSTPONED_AUDIO_MONITOR_EVENT_T {
 
 typedef struct POSTPONED_MIDI_CONTROL_CHANGE_EVENT_T {
     int8_t channel;
-    int8_t control;
+    uint16_t controller;    // if high bit set then controller is an nrpn
     int16_t value;
 } postponed_midi_control_change_event_t;
 
@@ -654,7 +654,7 @@ typedef struct POSTPONED_MIDI_MAP_EVENT_T {
     int effect_id;
     const char* symbol;
     int8_t channel;
-    uint8_t controller;
+    uint16_t controller;    // if high bit set then controller is an nrpn
     float value;
     float minimum;
     float maximum;
@@ -1569,7 +1569,7 @@ static void RunPostPonedEvents(int ignored_effect_id)
         case POSTPONED_MIDI_CONTROL_CHANGE:
             snprintf(buf, FEEDBACK_BUF_SIZE, "midi_control_change %i %i %i",
                      eventptr->event.control_change.channel,
-                     eventptr->event.control_change.control,
+                     eventptr->event.control_change.controller,
                      eventptr->event.control_change.value);
             socket_send_feedback_debug(buf);
             break;
@@ -3282,7 +3282,7 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
                 {
                     posteventptr->event.type = POSTPONED_MIDI_CONTROL_CHANGE;
                     posteventptr->event.control_change.channel = channel;
-                    posteventptr->event.control_change.control = controller;
+                    posteventptr->event.control_change.controller = controller;
                     posteventptr->event.control_change.value = mvalue;
 
                     pthread_mutex_lock(&g_rtsafe_mutex);
