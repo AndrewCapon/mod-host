@@ -8157,6 +8157,10 @@ int effects_midi_map(int effect_id, const char *control_symbol, int channel, int
         if (INSTANCE_IS_VALID(g_midi_cc_list[i].effect_id))
             continue;
 
+        g_midi_cc_list[i].channel = channel;
+        g_midi_cc_list[i].controller = controller;
+        g_midi_cc_list[i].effect_id = effect_id;
+
         if (is_bypass)
         {
             g_midi_cc_list[i].symbol = g_bypass_port_symbol;
@@ -8184,9 +8188,6 @@ int effects_midi_map(int effect_id, const char *control_symbol, int channel, int
                 SetMidiOutValue(&(g_midi_cc_list[i]));
         }
 
-        g_midi_cc_list[i].channel = channel;
-        g_midi_cc_list[i].controller = controller;
-        g_midi_cc_list[i].effect_id = effect_id;
         return SUCCESS;
     }
 
