@@ -318,7 +318,11 @@ enum UpdatePositionFlag {
     UPDATE_POSITION_FORCED,
 };
 
-
+enum MidiSetType {
+    MIDI_SET_DEFAULT,
+    MIDI_SET_MOMENTARY,
+    MIDI_SET_TOGGLE,
+};
 /*
 ************************************************************************************************************************
 *           LOCAL DATA TYPES
@@ -596,6 +600,7 @@ typedef struct MIDI_CC_T {
     const char* symbol;
     port_t* port;
     int16_t midiOutValue;
+    enum MidiSetType setType;
 } midi_cc_t;
 
 typedef struct ASSIGNMENT_T {
@@ -1088,8 +1093,10 @@ static void Log(const char *psFormatString, ...)
 }
 #endif
 
-static void SetMidiOutValue(midi_cc_t *midiCC)
+static int GetMidiOutValue(midi_cc_t *midiCC)
 {
+    int midiValue = -1;
+
     bool bIsValid = true;
     float fNormal;
 
@@ -1125,10 +1132,59 @@ static void SetMidiOutValue(midi_cc_t *midiCC)
     {
         // if high bit is set controller is an nrpn with 14 bit value
         if(midiCC->controller & 0x8000)
-            midiCC->midiOutValue = fNormal * 16383;
+            midiValue = fNormal * 16383;
         else
-            midiCC->midiOutValue = fNormal * 127;
+            midiValue = fNormal * 127;
     }
+
+    return midiValue;
+}
+
+static void SetMidiOutValue(midi_cc_t *midiCC)
+{
+    int midiValue = GetMidiOutValue(midiCC);
+    if(midiValue != -1)
+        midiCC->midiOutValue = midiValue;
+
+    // bool bIsValid = true;
+    // float fNormal;
+
+    // // Handle bypass. quick test first to avoid string comparison if not needed
+    // if(NULL == midiCC->port)
+    // {
+    //     bool bIsBypass = false;
+    //     for(const char *s1 = midiCC->symbol, *s2 = BYPASS_PORT_SYMBOL; (bIsBypass = *s1 == *s2) && *s1; s1++, s2++)
+    //         /* empty block */;
+
+    //     if(bIsBypass)
+    //     {
+    //         // get correct bypass value
+    //         effect_t *effect = &g_effects[midiCC->effect_id];
+    //         fNormal = !(effect->bypass); // As far as I can see effect->bypass is either 1 or 0 and inverted.
+    //     }
+    //     else
+    //     {
+    //         bIsValid = false;
+    //         if (g_verbose_debug)
+    //             printf("DEBUG: SetMidiOutValue '%s': port is null and midiCC is not a bypass\n", midiCC->symbol);
+    //     }
+    // }
+    // else
+    // {
+    //     float value = *(midiCC->port->buffer);
+
+    //     float fRange = midiCC->maximum - midiCC->minimum;
+    //     fNormal = (value - midiCC->minimum) / fRange;
+    // }
+
+    // if(bIsValid)
+    // {
+    //     // if high bit is set controller is an nrpn with 14 bit value
+    //     if(midiCC->controller & 0x8000)
+    //         midiCC->midiOutValue = fNormal * 16383;
+    //     else
+    //         midiCC->midiOutValue = fNormal * 127;
+    // }
 }
 
 static void InstanceDelete(int effect_id)
@@ -2686,13 +2742,26 @@ static bool SetPortValue(port_t *port, float value, int effect_id, bool is_bypas
 // FIXME merge most of this with SetPortValue
 static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres)
 {
+    //mcc->setType = MIDI_SET_MOMENTARY;// TODO REMOVE JUST TESTING
+
     const uint16_t mvaluediv = highres ? 8192 : 64;
 
     if (!strcmp(mcc->symbol, g_bypass_port_symbol))
     {
         effect_t *effect = &g_effects[mcc->effect_id];
 
-        const bool bypassed = mvalue < mvaluediv;
+        bool bypassed;
+        if(mcc->setType == MIDI_SET_MOMENTARY)
+        {
+            // we switch on a on value
+            if(mvalue > mvaluediv)
+                bypassed = (effect->bypass == 1.0f) ? 0.0f : 1.0f;
+            else
+                bypassed = effect->bypass;
+        }
+        else
+            bypassed = mvalue < mvaluediv;
+
         effect->bypass = bypassed ? 1.0f : 0.0f;
 
         if (effect->enabled_index >= 0)
@@ -2704,6 +2773,7 @@ static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres)
     port_t* port = mcc->port;
     float value;
 
+
     if (port->hints & HINT_TRIGGER)
     {
         // now triggered, always maximum
@@ -2711,8 +2781,16 @@ static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres)
     }
     else if (port->hints & HINT_TOGGLE)
     {
-        // toggle, always min or max
-        value = mvalue >= mvaluediv ? port->max_value : port->min_value;
+//        value = mvalue >= mvaluediv ? port->max_value : port->min_value; // only works for toggle midi controllers
+        if(mcc->setType == MIDI_SET_MOMENTARY)
+        {
+            if(mvalue >= mvaluediv)
+                value = (port->prev_value == port->max_value) ? port->min_value : port->max_value;
+            else
+                value = port->prev_value;
+        }
+        else
+            value = mvalue >= mvaluediv ? port->max_value : port->min_value;
 
         if (mcc->effect_id == GLOBAL_EFFECT_ID && !strcmp(mcc->symbol, g_rolling_port_symbol))
         {
@@ -2726,6 +2804,22 @@ static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres)
                 jack_transport_locate(g_jack_global_client, 0);
             }
             g_transport_reset = true;
+        }
+    }
+    else if ((port->hints & HINT_ENUMERATION) && (mcc->setType != MIDI_SET_DEFAULT))
+    {
+        // always increment if toggle, if momentary increment when larger than half
+        bool needIncrement = mcc->setType == MIDI_SET_TOGGLE ? true : mvalue > mvaluediv;
+
+        if(needIncrement) 
+        {
+            value = 1+(*(port->buffer));
+            if(value > port->max_value)
+                value = port->min_value;
+        } 
+        else 
+        {
+            value = *(port->buffer);
         }
     }
     else
@@ -5059,6 +5153,7 @@ int effects_init(void* client)
         g_midi_cc_list[i].symbol = NULL;
         g_midi_cc_list[i].port = NULL;
         g_midi_cc_list[i].midiOutValue = -1;
+        g_midi_cc_list[i].setType = MIDI_SET_DEFAULT;
     }
     g_midi_learning = NULL;
 
@@ -6384,6 +6479,8 @@ static void effects_remove_inner_pre(int effect_id)
             g_midi_cc_list[j].effect_id = unused;
             g_midi_cc_list[j].symbol = NULL;
             g_midi_cc_list[j].port = NULL;
+            g_midi_cc_list[j].midiOutValue = -1;
+            g_midi_cc_list[j].setType = MIDI_SET_DEFAULT;
         }
 
 #ifdef HAVE_CONTROLCHAIN
@@ -6506,6 +6603,8 @@ static void effects_remove_inner_pre(int effect_id)
             g_midi_cc_list[j].maximum = 1.0f;
             g_midi_cc_list[j].symbol = NULL;
             g_midi_cc_list[j].port = NULL;
+            g_midi_cc_list[j].midiOutValue = -1;
+            g_midi_cc_list[j].setType = MIDI_SET_DEFAULT;
         }
 
 #ifdef HAVE_CONTROLCHAIN
@@ -7073,10 +7172,12 @@ int effects_disconnect_all(const char *port)
     return ret;
 }
 
-void effects_send_midi_feedback(int effect_id, const char *control_symbol)
+midi_cc_t *effects_get_midi_cc(int effect_id, const char *control_symbol)
 {
     // TODO : we really should change the way this is all stored
     //        this code is all rather expensive and there is loads of it everywhere
+    midi_cc_t *result = NULL;
+
     for (int j = 0; j < MAX_MIDI_CC_ASSIGN; j++)
     {
         if (g_midi_cc_list[j].effect_id == ASSIGNMENT_NULL)
@@ -7091,10 +7192,21 @@ void effects_send_midi_feedback(int effect_id, const char *control_symbol)
                 /* empty loop*/;
 
             if(bEqual)
-                SetMidiOutValue(&(g_midi_cc_list[j]));
+            {
+                result = &(g_midi_cc_list[j]);
+                break;
+            }
         }
-        
     }
+
+    return result;
+}
+
+void effects_send_midi_feedback(int effect_id, const char *control_symbol)
+{
+    midi_cc_t *midi_cc =effects_get_midi_cc(effect_id, control_symbol);
+    if(midi_cc)
+        SetMidiOutValue(midi_cc);
 }
 
 int effects_set_parameter(int effect_id, const char *control_symbol, float value)
@@ -7107,8 +7219,6 @@ int effects_set_parameter(int effect_id, const char *control_symbol, float value
 #ifdef WITH_EXTERNAL_UI_SUPPORT
     static enum PortHints *last_hints;
 #endif
-    if(control_symbol && control_symbol[0]==':')
-        printf("srgg");
 
     if (InstanceExist(effect_id))
     {
@@ -7126,6 +7236,7 @@ int effects_set_parameter(int effect_id, const char *control_symbol, float value
 #ifdef WITH_EXTERNAL_UI_SUPPORT
                 *last_hints |= HINT_SHOULD_UPDATE;
 #endif
+            
             // if midi feedback is enabled find the correct CC and set it to be output
             if(g_enable_midi_feedback)
                 effects_send_midi_feedback(effect_id, control_symbol);
@@ -8224,6 +8335,9 @@ int effects_midi_unmap(int effect_id, const char *control_symbol)
         g_midi_cc_list[i].effect_id = ASSIGNMENT_UNUSED;
         g_midi_cc_list[i].symbol = NULL;
         g_midi_cc_list[i].port = NULL;
+        g_midi_cc_list[i].midiOutValue = -1;
+        g_midi_cc_list[i].setType = MIDI_SET_DEFAULT;
+
         return SUCCESS;
     }
 
