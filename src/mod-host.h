@@ -81,7 +81,7 @@
 #define MONITOR_MIDI_CONTROL    "monitor_midi_control %i %i"
 #define MONITOR_MIDI_PROGRAM    "monitor_midi_program %i %i"
 #define MIDI_LEARN              "midi_learn %i %s %f %f"
-#define MIDI_MAP                "midi_map %i %s %i %i %f %f"
+#define MIDI_MAP                "midi_map %i %s %i %i %f %f %i"
 #define MIDI_UNMAP              "midi_unmap %i %s"
 #define CC_MAP                  "cc_map %i %s %i %i %s %f %f %f %i %i %s %i ..."
 #define CC_VALUE_SET            "cc_value_set %i %s %f"

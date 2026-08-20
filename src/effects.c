@@ -318,11 +318,6 @@ enum UpdatePositionFlag {
     UPDATE_POSITION_FORCED,
 };
 
-enum MidiSetType {
-    MIDI_SET_DEFAULT,
-    MIDI_SET_MOMENTARY,
-    MIDI_SET_TOGGLE,
-};
 /*
 ************************************************************************************************************************
 *           LOCAL DATA TYPES
@@ -600,7 +595,7 @@ typedef struct MIDI_CC_T {
     const char* symbol;
     port_t* port;
     int16_t midiOutValue;
-    enum MidiSetType setType;
+    MidiSetType setType;
 } midi_cc_t;
 
 typedef struct ASSIGNMENT_T {
@@ -663,6 +658,7 @@ typedef struct POSTPONED_MIDI_MAP_EVENT_T {
     float value;
     float minimum;
     float maximum;
+    MidiSetType setType;
 } postponed_midi_map_event_t;
 
 typedef struct POSTPONED_TRANSPORT_EVENT_T {
@@ -801,6 +797,7 @@ static jack_port_t *g_audio_out2_port;
 static audio_monitor_t *g_audio_monitors;
 static pthread_mutex_t g_audio_monitor_mutex;
 static int g_audio_monitor_count;
+static int g_audio_monitor_port_id = 0; // this contains the next index to be used for a new audio monitor port name, it is never decremented when a port is removed
 static jack_port_t *g_midi_in_port;
 static jack_port_t *g_midi_out_port;
 static jack_position_t g_jack_pos;
@@ -1145,46 +1142,6 @@ static void SetMidiOutValue(midi_cc_t *midiCC)
     int midiValue = GetMidiOutValue(midiCC);
     if(midiValue != -1)
         midiCC->midiOutValue = midiValue;
-
-    // bool bIsValid = true;
-    // float fNormal;
-
-    // // Handle bypass. quick test first to avoid string comparison if not needed
-    // if(NULL == midiCC->port)
-    // {
-    //     bool bIsBypass = false;
-    //     for(const char *s1 = midiCC->symbol, *s2 = BYPASS_PORT_SYMBOL; (bIsBypass = *s1 == *s2) && *s1; s1++, s2++)
-    //         /* empty block */;
-
-    //     if(bIsBypass)
-    //     {
-    //         // get correct bypass value
-    //         effect_t *effect = &g_effects[midiCC->effect_id];
-    //         fNormal = !(effect->bypass); // As far as I can see effect->bypass is either 1 or 0 and inverted.
-    //     }
-    //     else
-    //     {
-    //         bIsValid = false;
-    //         if (g_verbose_debug)
-    //             printf("DEBUG: SetMidiOutValue '%s': port is null and midiCC is not a bypass\n", midiCC->symbol);
-    //     }
-    // }
-    // else
-    // {
-    //     float value = *(midiCC->port->buffer);
-
-    //     float fRange = midiCC->maximum - midiCC->minimum;
-    //     fNormal = (value - midiCC->minimum) / fRange;
-    // }
-
-    // if(bIsValid)
-    // {
-    //     // if high bit is set controller is an nrpn with 14 bit value
-    //     if(midiCC->controller & 0x8000)
-    //         midiCC->midiOutValue = fNormal * 16383;
-    //     else
-    //         midiCC->midiOutValue = fNormal * 127;
-    // }
 }
 
 static void InstanceDelete(int effect_id)
@@ -1612,13 +1569,14 @@ static void RunPostPonedEvents(int ignored_effect_id)
         case POSTPONED_MIDI_MAP:
             if (eventptr->event.midi_map.effect_id == ignored_effect_id)
                 continue;
-            snprintf(buf, FEEDBACK_BUF_SIZE, "midi_mapped %i %s %i %i %f %f %f", eventptr->event.midi_map.effect_id,
-                                                                                 eventptr->event.midi_map.symbol,
-                                                                                 eventptr->event.midi_map.channel,
-                                                                                 eventptr->event.midi_map.controller,
-                                                                                 eventptr->event.midi_map.value,
-                                                                                 eventptr->event.midi_map.minimum,
-                                                                                 eventptr->event.midi_map.maximum);
+            snprintf(buf, FEEDBACK_BUF_SIZE, "midi_mapped %i %s %i %i %f %f %f %i", eventptr->event.midi_map.effect_id,
+                                                                                    eventptr->event.midi_map.symbol,
+                                                                                    eventptr->event.midi_map.channel,
+                                                                                    eventptr->event.midi_map.controller,
+                                                                                    eventptr->event.midi_map.value,
+                                                                                    eventptr->event.midi_map.minimum,
+                                                                                    eventptr->event.midi_map.maximum,
+                                                                                    eventptr->event.midi_map.setType);
             socket_send_feedback_debug(buf);
             break;
 
@@ -2742,8 +2700,6 @@ static bool SetPortValue(port_t *port, float value, int effect_id, bool is_bypas
 // FIXME merge most of this with SetPortValue
 static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres)
 {
-    //mcc->setType = MIDI_SET_MOMENTARY;// TODO REMOVE JUST TESTING
-
     const uint16_t mvaluediv = highres ? 8192 : 64;
 
     if (!strcmp(mcc->symbol, g_bypass_port_symbol))
@@ -2773,7 +2729,6 @@ static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres)
     port_t* port = mcc->port;
     float value;
 
-
     if (port->hints & HINT_TRIGGER)
     {
         // now triggered, always maximum
@@ -2781,7 +2736,6 @@ static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres)
     }
     else if (port->hints & HINT_TOGGLE)
     {
-//        value = mvalue >= mvaluediv ? port->max_value : port->min_value; // only works for toggle midi controllers
         if(mcc->setType == MIDI_SET_MOMENTARY)
         {
             if(mvalue >= mvaluediv)
@@ -3360,6 +3314,7 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
                     posteventptr->event.midi_map.value      = value;
                     posteventptr->event.midi_map.minimum    = minimum;
                     posteventptr->event.midi_map.maximum    = maximum;
+                    posteventptr->event.midi_map.setType    = MIDI_SET_DEFAULT; // TODO setType
 
                     pthread_mutex_lock(&g_rtsafe_mutex);
                     list_add_tail(&posteventptr->siblings, &g_rtsafe_list);
@@ -8222,7 +8177,7 @@ int effects_midi_learn(int effect_id, const char *control_symbol, float minimum,
     return ERR_ASSIGNMENT_LIST_FULL;
 }
 
-int effects_midi_map(int effect_id, const char *control_symbol, int channel, int controller, float minimum, float maximum)
+int effects_midi_map(int effect_id, const char *control_symbol, int channel, int controller, float minimum, float maximum, MidiSetType setType)
 {
     port_t *port;
 
@@ -8248,6 +8203,7 @@ int effects_midi_map(int effect_id, const char *control_symbol, int channel, int
 
         g_midi_cc_list[i].channel = channel;
         g_midi_cc_list[i].controller = controller;
+        g_midi_cc_list[i].setType = setType;
 
         if (!is_bypass)
         {
@@ -8271,6 +8227,7 @@ int effects_midi_map(int effect_id, const char *control_symbol, int channel, int
         g_midi_cc_list[i].channel = channel;
         g_midi_cc_list[i].controller = controller;
         g_midi_cc_list[i].effect_id = effect_id;
+        g_midi_cc_list[i].setType = setType;
 
         if (is_bypass)
         {
@@ -9746,69 +9703,109 @@ int effects_multiple_controllers_enable(int enable)
 
 int effects_monitor_audio_levels(const char *source_port_name, int enable)
 {
-    if (g_jack_global_client == NULL)
+    if (g_jack_global_client == NULL || source_port_name == NULL || source_port_name[0] == '\0')
         return ERR_INVALID_OPERATION;
 
     if (enable)
     {
-        for (int i = 0; i < g_audio_monitor_count; ++i)
-        {
-            if (!strcmp(g_audio_monitors[i].source_port_name, source_port_name))
-                return SUCCESS;
-        }
+        int port_id = -1;
 
         pthread_mutex_lock(&g_audio_monitor_mutex);
-        g_audio_monitors = realloc(g_audio_monitors, sizeof(audio_monitor_t) * (g_audio_monitor_count + 1));
+        for (int i = 0; i < g_audio_monitor_count; ++i)
+        {
+            if (g_audio_monitors[i].source_port_name &&
+                strcmp(g_audio_monitors[i].source_port_name, source_port_name) == 0)
+            {
+                pthread_mutex_unlock(&g_audio_monitor_mutex);
+                return SUCCESS;
+            }
+        }
+
+        // assign new port id
+        port_id = ++g_audio_monitor_port_id;
         pthread_mutex_unlock(&g_audio_monitor_mutex);
 
-        if (g_audio_monitors == NULL)
-            return ERR_MEMORY_ALLOCATION;
-
-        audio_monitor_t *monitor = &g_audio_monitors[g_audio_monitor_count];
-
+        // setup new jack monitor port
         char port_name[0xff];
-        snprintf(port_name, sizeof(port_name) - 1, "monitor_%d", g_audio_monitor_count + 1);
+        snprintf(port_name, sizeof(port_name) - 1, "monitor_%d", port_id);
 
         jack_port_t *port = jack_port_register(g_jack_global_client,
                                                port_name,
                                                JACK_DEFAULT_AUDIO_TYPE,
                                                JackPortIsInput,
                                                0);
+
         if (port == NULL)
             return ERR_JACK_PORT_REGISTER;
 
         snprintf(port_name, sizeof(port_name) - 1, "%s:monitor_%d",
-                 jack_get_client_name(g_jack_global_client), g_audio_monitor_count + 1);
-        jack_connect(g_jack_global_client, source_port_name, port_name);
+                 jack_get_client_name(g_jack_global_client), port_id);
 
+        if (jack_connect(g_jack_global_client, source_port_name, port_name) != 0)
+        {
+            jack_port_unregister(g_jack_global_client, port);
+            return ERR_JACK_PORT_REGISTER;
+        }
+
+        // commit the new monitor port to the list of active monitors
+        pthread_mutex_lock(&g_audio_monitor_mutex);
+        audio_monitor_t *tmp = realloc(g_audio_monitors,
+                                      sizeof(audio_monitor_t) * (g_audio_monitor_count + 1));
+        if (tmp == NULL)
+        {
+            pthread_mutex_unlock(&g_audio_monitor_mutex);
+            jack_port_unregister(g_jack_global_client, port);
+            return ERR_MEMORY_ALLOCATION;
+        }
+
+        g_audio_monitors = tmp;
+
+        audio_monitor_t *monitor = &g_audio_monitors[g_audio_monitor_count];
         monitor->port = port;
         monitor->source_port_name = strdup(source_port_name);
         monitor->value = 0.f;
 
         ++g_audio_monitor_count;
+        pthread_mutex_unlock(&g_audio_monitor_mutex);
     }
     else
     {
-        if (g_audio_monitor_count == 0)
-            return ERR_INVALID_OPERATION;
-
-        audio_monitor_t *monitor = &g_audio_monitors[g_audio_monitor_count - 1];
-
-        if (strcmp(monitor->source_port_name, source_port_name))
-            return ERR_INVALID_OPERATION;
-
         pthread_mutex_lock(&g_audio_monitor_mutex);
-        --g_audio_monitor_count;
-        pthread_mutex_unlock(&g_audio_monitor_mutex);
+        int idx = -1;
+        for (int i = 0; i < g_audio_monitor_count; ++i)
+        {
+            if (!strcmp(g_audio_monitors[i].source_port_name, source_port_name))
+            {
+                idx = i;
+                break;
+            }
+        }
 
-        jack_port_unregister(g_jack_global_client, monitor->port);
-        free(monitor->source_port_name);
+        if (idx < 0)
+        {
+            pthread_mutex_unlock(&g_audio_monitor_mutex);
+            return ERR_INVALID_OPERATION;
+        }
+
+        jack_port_t *port = g_audio_monitors[idx].port;
+        char *source_name = g_audio_monitors[idx].source_port_name;
+
+        for (int i = idx; i + 1 < g_audio_monitor_count; ++i)
+        {
+            g_audio_monitors[i] = g_audio_monitors[i + 1];
+        }
+        --g_audio_monitor_count;
 
         if (g_audio_monitor_count == 0)
         {
             free(g_audio_monitors);
             g_audio_monitors = NULL;
         }
+        pthread_mutex_unlock(&g_audio_monitor_mutex);
+
+        // this can be slow, so we do it outside the mutex lock
+        jack_port_unregister(g_jack_global_client, port);
+        free(source_name);
     }
 
     return SUCCESS;

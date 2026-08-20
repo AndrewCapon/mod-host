@@ -424,7 +424,7 @@ static void midi_map_cb(proto_t *proto)
     int resp;
     resp = !effects_midi_map(atoi(proto->list[1]), proto->list[2],
                              atoi(proto->list[3]), atoi(proto->list[4]),
-                             atof(proto->list[5]), atof(proto->list[6]));
+                             atof(proto->list[5]), atof(proto->list[6]), atoi(proto->list[7]));
     protocol_response_int(resp, proto);
 }
 
