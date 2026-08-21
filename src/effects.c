@@ -595,7 +595,7 @@ typedef struct MIDI_CC_T {
     const char* symbol;
     port_t* port;
     int16_t midiOutValue;
-    MidiSetType setType;
+    MidiCCType ccType;
 } midi_cc_t;
 
 typedef struct ASSIGNMENT_T {
@@ -658,7 +658,7 @@ typedef struct POSTPONED_MIDI_MAP_EVENT_T {
     float value;
     float minimum;
     float maximum;
-    MidiSetType setType;
+    MidiCCType ccType;
 } postponed_midi_map_event_t;
 
 typedef struct POSTPONED_TRANSPORT_EVENT_T {
@@ -1576,7 +1576,7 @@ static void RunPostPonedEvents(int ignored_effect_id)
                                                                                     eventptr->event.midi_map.value,
                                                                                     eventptr->event.midi_map.minimum,
                                                                                     eventptr->event.midi_map.maximum,
-                                                                                    eventptr->event.midi_map.setType);
+                                                                                    eventptr->event.midi_map.ccType);
             socket_send_feedback_debug(buf);
             break;
 
@@ -2707,7 +2707,7 @@ static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres)
         effect_t *effect = &g_effects[mcc->effect_id];
 
         bool bypassed;
-        if(mcc->setType == MIDI_SET_MOMENTARY)
+        if(mcc->ccType == MIDI_CC_MOMENTARY)
         {
             // we switch on a on value
             if(mvalue > mvaluediv)
@@ -2736,7 +2736,7 @@ static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres)
     }
     else if (port->hints & HINT_TOGGLE)
     {
-        if(mcc->setType == MIDI_SET_MOMENTARY)
+        if(mcc->ccType == MIDI_CC_MOMENTARY)
         {
             if(mvalue >= mvaluediv)
                 value = (port->prev_value == port->max_value) ? port->min_value : port->max_value;
@@ -2760,10 +2760,10 @@ static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres)
             g_transport_reset = true;
         }
     }
-    else if ((port->hints & HINT_ENUMERATION) && (mcc->setType != MIDI_SET_DEFAULT))
+    else if ((port->hints & HINT_ENUMERATION) && (mcc->ccType != MIDI_CC_VARIABLE))
     {
         // always increment if toggle, if momentary increment when larger than half
-        bool needIncrement = mcc->setType == MIDI_SET_TOGGLE ? true : mvalue > mvaluediv;
+        bool needIncrement = mcc->ccType == MIDI_CC_TOGGLE ? true : mvalue > mvaluediv;
 
         if(needIncrement) 
         {
@@ -3314,7 +3314,7 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
                     posteventptr->event.midi_map.value      = value;
                     posteventptr->event.midi_map.minimum    = minimum;
                     posteventptr->event.midi_map.maximum    = maximum;
-                    posteventptr->event.midi_map.setType    = MIDI_SET_DEFAULT; // TODO setType
+                    posteventptr->event.midi_map.ccType     = MIDI_CC_VARIABLE;
 
                     pthread_mutex_lock(&g_rtsafe_mutex);
                     list_add_tail(&posteventptr->siblings, &g_rtsafe_list);
@@ -5108,7 +5108,7 @@ int effects_init(void* client)
         g_midi_cc_list[i].symbol = NULL;
         g_midi_cc_list[i].port = NULL;
         g_midi_cc_list[i].midiOutValue = -1;
-        g_midi_cc_list[i].setType = MIDI_SET_DEFAULT;
+        g_midi_cc_list[i].ccType = MIDI_CC_VARIABLE;
     }
     g_midi_learning = NULL;
 
@@ -6435,7 +6435,7 @@ static void effects_remove_inner_pre(int effect_id)
             g_midi_cc_list[j].symbol = NULL;
             g_midi_cc_list[j].port = NULL;
             g_midi_cc_list[j].midiOutValue = -1;
-            g_midi_cc_list[j].setType = MIDI_SET_DEFAULT;
+            g_midi_cc_list[j].ccType = MIDI_CC_VARIABLE;
         }
 
 #ifdef HAVE_CONTROLCHAIN
@@ -6559,7 +6559,7 @@ static void effects_remove_inner_pre(int effect_id)
             g_midi_cc_list[j].symbol = NULL;
             g_midi_cc_list[j].port = NULL;
             g_midi_cc_list[j].midiOutValue = -1;
-            g_midi_cc_list[j].setType = MIDI_SET_DEFAULT;
+            g_midi_cc_list[j].ccType = MIDI_CC_VARIABLE;
         }
 
 #ifdef HAVE_CONTROLCHAIN
@@ -8177,7 +8177,7 @@ int effects_midi_learn(int effect_id, const char *control_symbol, float minimum,
     return ERR_ASSIGNMENT_LIST_FULL;
 }
 
-int effects_midi_map(int effect_id, const char *control_symbol, int channel, int controller, float minimum, float maximum, MidiSetType setType)
+int effects_midi_map(int effect_id, const char *control_symbol, int channel, int controller, float minimum, float maximum, MidiCCType ccType)
 {
     port_t *port;
 
@@ -8203,7 +8203,7 @@ int effects_midi_map(int effect_id, const char *control_symbol, int channel, int
 
         g_midi_cc_list[i].channel = channel;
         g_midi_cc_list[i].controller = controller;
-        g_midi_cc_list[i].setType = setType;
+        g_midi_cc_list[i].ccType = ccType;
 
         if (!is_bypass)
         {
@@ -8227,7 +8227,7 @@ int effects_midi_map(int effect_id, const char *control_symbol, int channel, int
         g_midi_cc_list[i].channel = channel;
         g_midi_cc_list[i].controller = controller;
         g_midi_cc_list[i].effect_id = effect_id;
-        g_midi_cc_list[i].setType = setType;
+        g_midi_cc_list[i].ccType = ccType;
 
         if (is_bypass)
         {
@@ -8293,7 +8293,7 @@ int effects_midi_unmap(int effect_id, const char *control_symbol)
         g_midi_cc_list[i].symbol = NULL;
         g_midi_cc_list[i].port = NULL;
         g_midi_cc_list[i].midiOutValue = -1;
-        g_midi_cc_list[i].setType = MIDI_SET_DEFAULT;
+        g_midi_cc_list[i].ccType = MIDI_CC_VARIABLE;
 
         return SUCCESS;
     }

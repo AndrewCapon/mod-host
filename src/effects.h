@@ -85,10 +85,10 @@ typedef enum {
 } LogType;
 
 typedef enum {
-    MIDI_SET_DEFAULT,
-    MIDI_SET_MOMENTARY,
-    MIDI_SET_TOGGLE,
-} MidiSetType;
+    MIDI_CC_VARIABLE,
+    MIDI_CC_MOMENTARY,
+    MIDI_CC_TOGGLE,
+} MidiCCType;
 
 /*
 ************************************************************************************************************************
@@ -176,7 +176,7 @@ int effects_get_parameter_symbols(int effect_id, int output_ports, const char** 
 int effects_get_presets_uris(int effect_id, const char **uris);
 int effects_get_parameter_info(int effect_id, const char *control_symbol, float **range, const char **scale_points);
 int effects_midi_learn(int effect_id, const char *control_symbol, float minimum, float maximum);
-int effects_midi_map(int effect_id, const char *control_symbol, int channel, int controller, float minimum, float maximum, MidiSetType setType);
+int effects_midi_map(int effect_id, const char *control_symbol, int channel, int controller, float minimum, float maximum, MidiCCType ccType);
 int effects_midi_unmap(int effect_id, const char *control_symbol);
 int effects_licensee(int effect_id, char **licensee);
 int effects_set_beats_per_minute(double bpm);
