@@ -6419,7 +6419,7 @@ static void effects_remove_inner_pre(int effect_id)
         pthread_mutex_lock(&g_midi_learning_mutex);
         g_midi_learning = NULL;
         pthread_mutex_unlock(&g_midi_learning_mutex);
-
+#ifdef _DARKGLASS_PABLITO
         for (int j = MAX_MIDI_CC_ASSIGN, unused = ASSIGNMENT_NULL; --j >= 0;)
         {
             if (g_midi_cc_list[j].effect_id >= MAX_PLUGIN_INSTANCES && g_midi_cc_list[j].effect_id < MAX_INSTANCES)
@@ -6437,7 +6437,18 @@ static void effects_remove_inner_pre(int effect_id)
             g_midi_cc_list[j].midiOutValue = -1;
             g_midi_cc_list[j].ccType = MIDI_CC_VARIABLE;
         }
-
+#else
+        for (int j = 0; j < MAX_MIDI_CC_ASSIGN; j++)
+        {
+            g_midi_cc_list[j].channel = -1;
+            g_midi_cc_list[j].controller = 0;
+            g_midi_cc_list[j].minimum = 0.0f;
+            g_midi_cc_list[j].maximum = 1.0f;
+            g_midi_cc_list[j].effect_id = ASSIGNMENT_NULL;
+            g_midi_cc_list[j].symbol = NULL;
+            g_midi_cc_list[j].port = NULL;
+        }
+#endif
 #ifdef HAVE_CONTROLCHAIN
         if (g_cc_client)
         {
