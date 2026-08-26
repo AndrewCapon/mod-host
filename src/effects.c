@@ -2748,16 +2748,33 @@ static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres)
 
         if (mcc->effect_id == GLOBAL_EFFECT_ID && !strcmp(mcc->symbol, g_rolling_port_symbol))
         {
-            if (mvalue >= mvaluediv)
+            if(mcc->ccType == MIDI_CC_MOMENTARY)
             {
-                jack_transport_start(g_jack_global_client);
+                if((value == port->max_value) && (value != port->prev_value))
+                {
+                    jack_transport_start(g_jack_global_client);
+                    g_transport_reset = true;
+                }
+                else if((value == port->min_value) && (value != port->prev_value))
+                {
+                    jack_transport_stop(g_jack_global_client);
+                    jack_transport_locate(g_jack_global_client, 0);
+                    g_transport_reset = true;
+                }
             }
             else
             {
-                jack_transport_stop(g_jack_global_client);
-                jack_transport_locate(g_jack_global_client, 0);
+                if (mvalue >= mvaluediv)
+                {
+                    jack_transport_start(g_jack_global_client);
+                }
+                else
+                {
+                    jack_transport_stop(g_jack_global_client);
+                    jack_transport_locate(g_jack_global_client, 0);
+                }
+                g_transport_reset = true;
             }
-            g_transport_reset = true;
         }
     }
     else if ((port->hints & HINT_ENUMERATION) && (mcc->ccType != MIDI_CC_VARIABLE))
