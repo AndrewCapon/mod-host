@@ -4772,9 +4772,9 @@ int effects_init(void* client)
         port_t *port_bpb = ports[0] = calloc(1, sizeof(port_t));
         port_bpb->buffer = &port_bpb->prev_value;
         port_bpb->buffer_count = 1;
-        port_bpb->min_value = 0.0f;
-        port_bpb->max_value = 1.0f;
-        port_bpb->def_value = 0.0f;
+        port_bpb->min_value = 1.0f;
+        port_bpb->max_value = 16.0f;
+        port_bpb->def_value = 4.0f;
         port_bpb->type = TYPE_CONTROL;
         port_bpb->flow = FLOW_INPUT;
         port_bpb->hints = 0x0;
@@ -4784,9 +4784,9 @@ int effects_init(void* client)
         port_t *port_bpm = ports[1] = calloc(1, sizeof(port_t));
         port_bpm->buffer = &port_bpm->prev_value;
         port_bpm->buffer_count = 1;
-        port_bpm->min_value = 0.0f;
-        port_bpm->max_value = 1.0f;
-        port_bpm->def_value = 0.0f;
+        port_bpm->min_value = 20.0f;
+        port_bpm->max_value = 280.0f;
+        port_bpm->def_value = 120.0f;
         port_bpm->type = TYPE_CONTROL;
         port_bpm->flow = FLOW_INPUT;
         port_bpm->hints = 0x0;
@@ -9855,6 +9855,9 @@ void effects_transport(int rolling, double beats_per_bar, double beats_per_minut
         fprintf(stderr, "trying to change transport BPM while MIDI sync enabled, expect issues!\n");
     }
 
+    const bool bpb_changed = g_transport_bpb != beats_per_bar;
+    const bool bpm_changed = g_transport_bpm != beats_per_minute;
+
     g_transport_bpb = beats_per_bar;
     g_transport_bpm = beats_per_minute;
 
@@ -9904,6 +9907,18 @@ void effects_transport(int rolling, double beats_per_bar, double beats_per_minut
         if (g_verbose_debug) {
             puts("DEBUG: effects_transport rolling status ignored");
         }
+    }
+
+    if(g_enable_midi_feedback) 
+    {
+        if(bpb_changed)
+            effects_set_parameter(9995, BPB_PORT_SYMBOL, g_transport_bpb);
+
+        if(bpm_changed)
+            effects_set_parameter(9995, BPM_PORT_SYMBOL, g_transport_bpm);
+
+        if(rolling_changed)
+            effects_set_parameter(9995, ROLLING_PORT_SYMBOL, rolling);
     }
 
     if (g_verbose_debug) {
