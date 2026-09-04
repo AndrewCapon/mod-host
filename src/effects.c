@@ -2678,11 +2678,8 @@ static bool SetPortValue(port_t *port, float value, int effect_id, bool is_bypas
     list_add_tail(&posteventptr->siblings, &g_rtsafe_list);
     pthread_mutex_unlock(&g_rtsafe_mutex);
 
-    if (update_transport)
-        return UpdateGlobalJackPosition(UPDATE_POSITION_FORCED, false);
-
     // if we have midi feedback enabled and upate_midi is true send midi out
-    if(g_enable_multiple_controllers && g_enable_midi_feedback)
+    if(g_enable_multiple_controllers)
     { 
         if(update_midi) {
             if (g_verbose_debug)
@@ -2693,6 +2690,9 @@ static bool SetPortValue(port_t *port, float value, int effect_id, bool is_bypas
         else if (g_verbose_debug) 
             printf("DEBUG: SetPortValue() not sending midi\n");
     }
+
+    if (update_transport)
+        return UpdateGlobalJackPosition(UPDATE_POSITION_FORCED, false);
 
     return true;
 }
