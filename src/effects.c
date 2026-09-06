@@ -3266,27 +3266,32 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
             if (g_midi_cc_list[j].controller == controller)
             {
                 handled = true;
+                float oldValue = g_midi_cc_list[j].port->prev_value;
                 value = UpdateValueFromMidi(&g_midi_cc_list[j], mvalue, highres);
 
-                // if midi feedback sync is enabled set the output CC to send back out over midi
-                // this will keep any other devices synced.
-                if(g_enable_midi_feedback_sync)
-                    SetMidiOutValue(&(g_midi_cc_list[j]));
-
-                postponed_event_list_data* const posteventptr = rtsafe_memory_pool_allocate_atomic(g_rtsafe_mem_pool);
-
-                if (posteventptr)
+                // only set param if value actually changed
+                if(oldValue != value)
                 {
-                    posteventptr->event.type = POSTPONED_PARAM_SET;
-                    posteventptr->event.parameter.effect_id = g_midi_cc_list[j].effect_id;
-                    posteventptr->event.parameter.symbol    = g_midi_cc_list[j].symbol;
-                    posteventptr->event.parameter.value     = value;
+                    // if midi feedback sync is enabled set the output CC to send back out over midi
+                    // this will keep any other devices synced.
+                    if(g_enable_midi_feedback_sync)
+                        SetMidiOutValue(&(g_midi_cc_list[j]));
 
-                    pthread_mutex_lock(&g_rtsafe_mutex);
-                    list_add_tail(&posteventptr->siblings, &g_rtsafe_list);
-                    pthread_mutex_unlock(&g_rtsafe_mutex);
+                    postponed_event_list_data* const posteventptr = rtsafe_memory_pool_allocate_atomic(g_rtsafe_mem_pool);
 
-                    needs_post = true;
+                    if (posteventptr)
+                    {
+                        posteventptr->event.type = POSTPONED_PARAM_SET;
+                        posteventptr->event.parameter.effect_id = g_midi_cc_list[j].effect_id;
+                        posteventptr->event.parameter.symbol    = g_midi_cc_list[j].symbol;
+                        posteventptr->event.parameter.value     = value;
+
+                        pthread_mutex_lock(&g_rtsafe_mutex);
+                        list_add_tail(&posteventptr->siblings, &g_rtsafe_list);
+                        pthread_mutex_unlock(&g_rtsafe_mutex);
+
+                        needs_post = true;
+                    }
                 }
 
                 break;
