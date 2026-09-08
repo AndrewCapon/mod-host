@@ -181,6 +181,7 @@ typedef struct {
 #include "rtmempool/rtmempool.h"
 #include "filter.h"
 #include "mod-memset.h"
+#include "tap_tempo.h"
 
 #ifdef MOD_HMI_CONTROL_ENABLED
 #include "sys_host.h"
@@ -759,6 +760,7 @@ typedef struct CACHED_EFFECT_FLUSH_T {
 ************************************************************************************************************************
 */
 
+static tap_tempo_t g_tap_tempo;
 static effect_t g_effects[MAX_INSTANCES];
 static midi_cc_t g_midi_cc_list[MAX_MIDI_CC_ASSIGN], *g_midi_learning;
 
@@ -2724,6 +2726,24 @@ static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres)
             *(effect->ports[effect->enabled_index]->buffer) = bypassed ? 0.0f : 1.0f;
 
         return bypassed ? 1.0f : 0.0f;
+    }
+
+    if ((mcc->ccType !=  MIDI_CC_VARIABLE) && !strcmp(mcc->symbol, g_bpm_port_symbol))
+    {
+        // Tap Tempo code
+        effect_t *effect = &g_effects[mcc->effect_id];
+
+        if(mcc->ccType == MIDI_CC_MOMENTARY)
+        {
+            // we trigger only on a on value
+            if(mvalue > mvaluediv)
+                effect->transport_bpm = TapTempoUpdate(&g_tap_tempo);
+        }
+        else
+            effect->transport_bpm = TapTempoUpdate(&g_tap_tempo);
+
+        printf("******** Tap Tempo here we come %f\n", effect->transport_bpm);
+        return effect->transport_bpm;
     }
 
     port_t* port = mcc->port;
@@ -5133,6 +5153,9 @@ int effects_init(void* client)
         g_midi_cc_list[i].ccType = MIDI_CC_VARIABLE;
     }
     g_midi_learning = NULL;
+
+    /* init tap tempo from midi */
+    TapTempoInit(&g_tap_tempo);
 
     memset(g_monitored_midi_controls, 0, sizeof(g_monitored_midi_controls));
     memset(g_monitored_midi_programs, 0, sizeof(g_monitored_midi_programs));
