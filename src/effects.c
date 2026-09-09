@@ -3286,7 +3286,7 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
             if (g_midi_cc_list[j].controller == controller)
             {
                 handled = true;
-                float oldValue = g_midi_cc_list[j].port->prev_value;
+                float oldValue = g_midi_cc_list[j].port ? g_midi_cc_list[j].port->prev_value : NAN;
                 value = UpdateValueFromMidi(&g_midi_cc_list[j], mvalue, highres);
 
                 // only set param if value actually changed
