@@ -4739,6 +4739,8 @@ int effects_init(void* client)
         return ERR_JACK_CLIENT_CREATION;
     }
 
+    time_ns_init();
+
     /* Register jack ports */
     g_midi_in_port = jack_port_register(g_jack_global_client, "midi_in", JACK_DEFAULT_MIDI_TYPE, JackPortIsInput, 0);
 
