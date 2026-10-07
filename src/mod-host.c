@@ -1275,7 +1275,7 @@ int main(int argc, char **argv)
         msg.data = malloc(msg.data_size + 24);
         fseek(f, 0, SEEK_SET);
         strcpy(msg.data, "patch_set 1337 urn:test ");
-        fread(msg.data + 24, msg.data_size, 1, f);
+        (void)!fread(msg.data + 24, msg.data_size, 1, f);
         fclose(f);
         protocol_parse(&msg);
         free(msg.data);

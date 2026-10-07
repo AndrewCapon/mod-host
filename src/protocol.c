@@ -222,7 +222,7 @@ void protocol_parse(msg_t *msg)
             {
 #ifndef SKIP_READLINE
                 if (msg->sender_id == STDOUT_FILENO)
-                    write(msg->sender_id, proto.response, proto.response_size+1);
+                    (void)! write(msg->sender_id, proto.response, proto.response_size+1);
                 else
 #endif
                     socket_send(msg->sender_id, proto.response, proto.response_size+1);
@@ -237,7 +237,7 @@ void protocol_parse(msg_t *msg)
     {
 #ifndef SKIP_READLINE
         if (msg->sender_id == STDOUT_FILENO)
-            write(msg->sender_id, g_error_messages[-index-1], strlen(g_error_messages[-index-1])+1);
+            (void)! write(msg->sender_id, g_error_messages[-index-1], strlen(g_error_messages[-index-1])+1);
         else
 #endif
             socket_send(msg->sender_id, g_error_messages[-index-1], strlen(g_error_messages[-index-1])+1);
