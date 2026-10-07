@@ -3268,7 +3268,7 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
             continue;
 
         // check if it's a Note message
-        if(status_nibble == 0x80 || status_nibble == 0x81)
+        if(status_nibble == 0x80 || status_nibble == 0x90)
         {
             controller = EncodedControllerForController(event.buffer[1], MIDI_TYPE_NOTE);
             mvalue = (status_nibble & 0x10) ? 127 : 0;
