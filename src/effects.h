@@ -90,6 +90,16 @@ typedef enum {
     MIDI_CC_TOGGLE,
 } MidiCCType;
 
+typedef enum {
+    MIDI_TYPE_CC         = 0x0000,
+    MIDI_TYPE_PITCHBEND  = 0x0080,
+    MIDI_TYPE_NRPN       = 0x8000,
+    MIDI_TYPE_CC_14      = 0xC000,
+    MIDI_TYPE_NOTE       = 0x4000,
+    MIDI_TYPE_MASK       = 0x3FFF
+} MidiType;
+
+
 /*
 ************************************************************************************************************************
 *           CONFIGURATION DEFINES

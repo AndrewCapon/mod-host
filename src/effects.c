@@ -604,6 +604,7 @@ typedef struct MIDI_CC_T {
     port_t* port;
     int16_t midiOutValue;
     MidiCCType ccType;
+    uint16_t possible_14_value;
 } midi_cc_t;
 
 typedef struct ASSIGNMENT_T {
@@ -1033,6 +1034,10 @@ static void ExternalControllerWriteFunction(LV2UI_Controller controller,
 static void* effects_activate_thread(void* arg);
 static void* effects_deactivate_thread(void* arg);
 
+static MidiType GetControllerMidiType(uint16_t controller);
+static uint16_t EncodedControllerForController(uint16_t controller, MidiType midiType);
+static uint16_t ControllerForEncodedController(uint16_t controller);
+
 /*
 ************************************************************************************************************************
 *           LOCAL CONFIGURATION ERRORS
@@ -1106,6 +1111,46 @@ static void Log(const char *psFormatString, ...)
 }
 #endif
 
+static MidiType GetControllerMidiType(uint16_t controller)
+{
+    // 15  14  7   type
+    // ====================
+    // 0   0   0   7 bit CC
+    // 0   0   1   Pitchbend
+    // 0   1   x   Note
+    // 1   0   x   14 bit NRPN
+    // 1   1   x   14 bit CC
+
+    MidiType type = MIDI_TYPE_CC;
+
+    if(controller & 0x8000)
+    {
+        if(controller & 0x4000)
+            type = MIDI_TYPE_CC_14;
+        else
+            type = MIDI_TYPE_NRPN;
+    }
+    else
+    {
+        if(controller & 0x4000)
+            type = MIDI_TYPE_NOTE;
+        else if(controller & 0x0080)
+            type = MIDI_TYPE_PITCHBEND;
+    }
+
+    return type;
+}
+
+static uint16_t EncodedControllerForController(uint16_t controller, MidiType midiType)
+{
+    return (controller & MIDI_TYPE_MASK) + midiType;
+}
+
+static uint16_t ControllerForEncodedController(uint16_t controller)
+{
+     return controller & MIDI_TYPE_MASK;
+}
+
 static int GetMidiOutValue(midi_cc_t *midiCC)
 {
     int midiValue = -1;
@@ -1143,8 +1188,8 @@ static int GetMidiOutValue(midi_cc_t *midiCC)
 
     if(bIsValid)
     {
-        // if high bit is set controller is an nrpn with 14 bit value
-        if(midiCC->controller & 0x8000)
+        MidiType midiType = GetControllerMidiType(midiCC->controller);
+        if(MIDI_TYPE_NRPN == midiType || MIDI_TYPE_CC_14 == midiType)
             midiValue = fNormal * 16383;
         else
             midiValue = fNormal * 127;
@@ -2109,7 +2154,7 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
     const float *buffer_in;
     float *buffer_out;
     float value;
-    uint64_t time_start;
+    uint64_t time_start=0;
 
     if (monitor_cpu)
         time_start = time_ns_get();
@@ -2989,6 +3034,9 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
     jack_midi_event_t event;
     uint8_t channel;
     uint16_t controller;
+    uint16_t controller_14_msb;
+    bool possible_14_bit_msb;
+    bool possible_14_bit_lsb;
     uint8_t status_nibble;
     uint16_t mvalue;
     float value;
@@ -3037,12 +3085,42 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
                     continue;
                 if (g_midi_cc_list[j].midiOutValue >= 0)
                 {
-                    if(g_midi_cc_list[j].controller & 0x8000)
+                    MidiType midiType = GetControllerMidiType(g_midi_cc_list[j].controller);
+                    uint16_t controller = ControllerForEncodedController(g_midi_cc_list[j].controller);
+                    if(MIDI_TYPE_CC_14 == midiType)
+                    {
+                        // 14 bit cc (0-31) MSB and LSB 32 above
+                        jack_midi_data_t buffer[3];
+                        buffer [0] = 0xb0 + g_midi_cc_list[j].channel;
+                        buffer [1] = controller;
+                        buffer [2] = g_midi_cc_list[j].midiOutValue>>7;
+                        error_sending = jack_midi_event_write(buf, 0, buffer, 3);
+
+                        buffer [0] = 0xb0 + g_midi_cc_list[j].channel;
+                        buffer [1] = 32 + controller;
+                        buffer [2] = g_midi_cc_list[j].midiOutValue & 0x007F;
+                        g_midi_cc_list[j].midiOutValue = -1;
+                        error_sending = jack_midi_event_write(buf, 0, buffer, 3);
+                    }
+                    else if(MIDI_TYPE_NOTE == midiType) {
+                        // Simple note on and off
+                        jack_midi_data_t buffer[3];
+                        if(g_midi_cc_list[j].midiOutValue == 0)
+                            buffer [0] = 0x80 + g_midi_cc_list[j].channel;
+                        else
+                            buffer [0] = 0x90 + g_midi_cc_list[j].channel;
+
+                        buffer [1] = g_midi_cc_list[j].controller;
+                        buffer [2] = g_midi_cc_list[j].midiOutValue;
+                        g_midi_cc_list[j].midiOutValue = -1;
+                        error_sending = jack_midi_event_write(buf, 0, buffer, 3);
+                    }
+                    else if(MIDI_TYPE_NRPN == midiType)
                     {
                         if(g_enable_nrpn)
                         {
                             // the controller is an nrpn, send 4 events for the nrpn
-                            uint16_t controller = g_midi_cc_list[j].controller & 0x7FFF;
+                            // uint16_t controller = g_midi_cc_list[j].controller & 0x7FFF;
 
                             jack_midi_data_t ccs[4] = {99, 98, 6, 38};
                             jack_midi_data_t data[4] = {controller >> 7, controller & 0x007F, g_midi_cc_list[j].midiOutValue >> 7, g_midi_cc_list[j].midiOutValue & 0x007F};
@@ -3084,6 +3162,9 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
     {
         if (jack_midi_event_get(&event, port_buf, i) != 0)
             break;
+
+        possible_14_bit_msb = false;
+        possible_14_bit_lsb = false;
 
         // Handle MIDI Beat Clock
         if (g_transport_sync_mode == TRANSPORT_SYNC_MIDI)
@@ -3186,12 +3267,35 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
         if (event.size != 3)
             continue;
 
+        // check if it's a Note message
+        if(status_nibble == 0x80 || status_nibble == 0x81)
+        {
+            controller = EncodedControllerForController(event.buffer[1], MIDI_TYPE_NOTE);
+            mvalue = (status_nibble & 0x10) ? 127 : 0;
+            highres    = false;
+        }
         // check if it's a CC or Pitchbend event
-        if (status_nibble == 0xB0)
+        else if (status_nibble == 0xB0)
         {
             controller = event.buffer[1];
             mvalue     = event.buffer[2];
             highres    = false;
+
+            if(controller < 32)
+            {
+                controller_14_msb = EncodedControllerForController(controller, MIDI_TYPE_CC_14);
+                possible_14_bit_msb = true;
+            }
+            else if (controller >= 32 && controller < 64)
+            {
+                controller_14_msb = EncodedControllerForController(controller-32, MIDI_TYPE_CC_14);
+                possible_14_bit_lsb = true;
+            }
+            else
+            {
+                controller_14_msb = 0;
+            }
+
 
             if(g_enable_nrpn)
             {
@@ -3356,7 +3460,48 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
 #endif
 
             // TODO: avoid race condition against effects_midi_unmap
-            if (g_midi_cc_list[j].controller == controller)
+            if (possible_14_bit_msb && g_midi_cc_list[j].controller == controller_14_msb)
+            {
+                printf("DEBUG: got 14 bit MSB\n");
+                handled = true;
+                g_midi_cc_list[j].possible_14_value = mvalue<<7;
+            }
+            else if (possible_14_bit_lsb && g_midi_cc_list[j].controller == controller_14_msb)
+            {
+                printf("DEBUG: got 14 bit LSB\n");
+                handled = true;
+                g_midi_cc_list[j].possible_14_value += mvalue;
+                mvalue = g_midi_cc_list[j].possible_14_value;
+
+                float oldValue = g_midi_cc_list[j].port ? g_midi_cc_list[j].port->prev_value : NAN;
+                value = UpdateValueFromMidi(&g_midi_cc_list[j], mvalue, true);
+                printf("DEBUG: 14 bit = %u, value = %f oldValue = %f\n", mvalue, value, oldValue);
+                // only set param if value actually changed
+                if(oldValue != value)
+                {
+                    // if midi feedback sync is enabled set the output CC to send back out over midi
+                    // this will keep any other devices synced.
+                    if(g_enable_midi_feedback_sync)
+                        SetMidiOutValue(&(g_midi_cc_list[j])); // TODO this is wrong for 14 bit cc
+
+                    postponed_event_list_data* const posteventptr = rtsafe_memory_pool_allocate_atomic(g_rtsafe_mem_pool);
+
+                    if (posteventptr)
+                    {
+                        posteventptr->event.type = POSTPONED_PARAM_SET;
+                        posteventptr->event.parameter.effect_id = g_midi_cc_list[j].effect_id;
+                        posteventptr->event.parameter.symbol    = g_midi_cc_list[j].symbol;
+                        posteventptr->event.parameter.value     = value;
+
+                        pthread_mutex_lock(&g_rtsafe_mutex);
+                        list_add_tail(&posteventptr->siblings, &g_rtsafe_list);
+                        pthread_mutex_unlock(&g_rtsafe_mutex);
+
+                        needs_post = true;
+                    }
+                }
+            }
+            else if (g_midi_cc_list[j].controller == controller)
             {
                 handled = true;
                 float oldValue = g_midi_cc_list[j].port ? g_midi_cc_list[j].port->prev_value : NAN;
@@ -3397,6 +3542,8 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
             const char* symbol;
             float minimum, maximum;
 
+            MidiType midiType = GetControllerMidiType(controller);
+
             pthread_mutex_lock(&g_midi_learning_mutex);
             if (g_midi_learning != NULL)
             {
@@ -3407,6 +3554,8 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
                 value     = UpdateValueFromMidi(g_midi_learning, mvalue, highres);
                 g_midi_learning->channel    = channel;
                 g_midi_learning->controller = controller;
+                if(midiType == MIDI_TYPE_NOTE)
+                    g_midi_learning->ccType = MIDI_CC_MOMENTARY;
                 g_midi_learning = NULL;
             }
             else
@@ -3429,7 +3578,11 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
                     posteventptr->event.midi_map.value      = value;
                     posteventptr->event.midi_map.minimum    = minimum;
                     posteventptr->event.midi_map.maximum    = maximum;
-                    posteventptr->event.midi_map.ccType     = MIDI_CC_VARIABLE;
+
+                    if(midiType == MIDI_TYPE_NOTE)
+                        posteventptr->event.midi_map.ccType     = MIDI_CC_MOMENTARY;
+                    else
+                        posteventptr->event.midi_map.ccType     = MIDI_CC_VARIABLE;
 
                     pthread_mutex_lock(&g_rtsafe_mutex);
                     list_add_tail(&posteventptr->siblings, &g_rtsafe_list);
@@ -5227,6 +5380,7 @@ int effects_init(void* client)
         g_midi_cc_list[i].port = NULL;
         g_midi_cc_list[i].midiOutValue = -1;
         g_midi_cc_list[i].ccType = MIDI_CC_VARIABLE;
+        g_midi_cc_list[i].possible_14_value = 0;
     }
     g_midi_learning = NULL;
 
@@ -6562,6 +6716,7 @@ static void effects_remove_inner_pre(int effect_id)
             g_midi_cc_list[j].port = NULL;
             g_midi_cc_list[j].midiOutValue = -1;
             g_midi_cc_list[j].ccType = MIDI_CC_VARIABLE;
+            g_midi_cc_list[j].possible_14_value = 0;
         }
         
 #ifdef HAVE_CONTROLCHAIN
@@ -6686,6 +6841,7 @@ static void effects_remove_inner_pre(int effect_id)
             g_midi_cc_list[j].port = NULL;
             g_midi_cc_list[j].midiOutValue = -1;
             g_midi_cc_list[j].ccType = MIDI_CC_VARIABLE;
+            g_midi_cc_list[j].possible_14_value = 0;
         }
 
 #ifdef HAVE_CONTROLCHAIN
@@ -7329,9 +7485,6 @@ int effects_set_parameter(int effect_id, const char *control_symbol, float value
         port = FindEffectInputPortBySymbol(&(g_effects[effect_id]), control_symbol);
         if (port)
         {
-            if (g_enable_multiple_controllers) {
-                
-            }
             // stores the data of the current control
             last_effect_id = effect_id;
             last_min = port->min_value;
@@ -8330,6 +8483,7 @@ int effects_midi_map(int effect_id, const char *control_symbol, int channel, int
         g_midi_cc_list[i].channel = channel;
         g_midi_cc_list[i].controller = controller;
         g_midi_cc_list[i].ccType = ccType;
+        g_midi_cc_list[i].possible_14_value = 0;
 
         if (!is_bypass)
         {
@@ -8354,6 +8508,7 @@ int effects_midi_map(int effect_id, const char *control_symbol, int channel, int
         g_midi_cc_list[i].controller = controller;
         g_midi_cc_list[i].effect_id = effect_id;
         g_midi_cc_list[i].ccType = ccType;
+        g_midi_cc_list[i].possible_14_value = 0;
 
         if (is_bypass)
         {
@@ -8420,6 +8575,7 @@ int effects_midi_unmap(int effect_id, const char *control_symbol)
         g_midi_cc_list[i].port = NULL;
         g_midi_cc_list[i].midiOutValue = -1;
         g_midi_cc_list[i].ccType = MIDI_CC_VARIABLE;
+        g_midi_cc_list[i].possible_14_value = 0;
 
         return SUCCESS;
     }
