@@ -22,11 +22,11 @@ void TapTempoInit(tap_tempo_t *tap_tempo)
 	tap_tempo->last_time = 0;
 }
 
-float TapTempoUpdate(tap_tempo_t *tap_tempo)
+double TapTempoUpdate(tap_tempo_t *tap_tempo, double current_bpm)
 {
-	float         result = 20.0f;
+	double        result = current_bpm;
 	unsigned long current_ms    = TapTempoGetCurrentMS();
-	float         interval_time = current_ms - tap_tempo->last_time;
+	double        interval_time = current_ms - tap_tempo->last_time;
 
 	if(tap_tempo->last_time && (interval_time > TT_MAXTIME))
 		TapTempoInit(tap_tempo);

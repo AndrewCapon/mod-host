@@ -12,7 +12,7 @@ void ma_reset(moving_average_data_t *ma)
     ma->data[u] = 0.0f;
 }
 
-void ma_init(moving_average_data_t *ma, float *data, uint16_t size, bool alwaysAccurate)
+void ma_init(moving_average_data_t *ma, double *data, uint16_t size, bool alwaysAccurate)
 {
   ma->size = size;
   ma->data = data;
@@ -21,9 +21,9 @@ void ma_init(moving_average_data_t *ma, float *data, uint16_t size, bool alwaysA
 }
 
 
-void ma_add(moving_average_data_t *ma, float fValue)
+void ma_add(moving_average_data_t *ma, double fValue)
 {
-  float fRemoved = ma->data[ma->idx];
+  double fRemoved = ma->data[ma->idx];
   ma->data[ma->idx] = fValue;
   
   ma->count ++;
@@ -41,7 +41,7 @@ void ma_add(moving_average_data_t *ma, float fValue)
   ma->idx = (ma->idx+1) % ma->size ;
 }
 
-void ma_add_all(moving_average_data_t *ma, float fValue)
+void ma_add_all(moving_average_data_t *ma, double fValue)
 {
   ma->average = fValue;
   ma->count = ma->size ;
@@ -50,7 +50,7 @@ void ma_add_all(moving_average_data_t *ma, float fValue)
     ma->data[u] = fValue;
 }
 
-float ma_average(moving_average_data_t *ma)
+double ma_average(moving_average_data_t *ma)
 {
   return ma->average;
 }

@@ -13,12 +13,12 @@
 typedef struct _tap_tempo_t
 {
   moving_average_data_t	ma;
-	float									intervals[TT_MAXTAPS];
-	unsigned long 				last_time;
+  double 							  intervals[TT_MAXTAPS];
+  unsigned long 				last_time;
 } tap_tempo_t;
 
 
 void  TapTempoInit(tap_tempo_t *tt_data);
-float TapTempoUpdate(tap_tempo_t *tt_data);
+double TapTempoUpdate(tap_tempo_t *tt_data, double current_bpm);
 
 #endif

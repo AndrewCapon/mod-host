@@ -2855,12 +2855,15 @@ static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres)
         {
             // we trigger only on a on value
             if(mvalue > mvaluediv)
-                effect->transport_bpm = TapTempoUpdate(&g_tap_tempo);
+                g_transport_bpm = TapTempoUpdate(&g_tap_tempo, g_transport_bpm);
         }
         else
-            effect->transport_bpm = TapTempoUpdate(&g_tap_tempo);
+            g_transport_bpm = TapTempoUpdate(&g_tap_tempo, g_transport_bpm);
 
-        printf("******** Tap Tempo here we come %f\n", effect->transport_bpm);
+        if(UpdateGlobalJackPosition(UPDATE_POSITION_FORCED, false))
+            sem_post(&g_postevents_semaphore);
+
+        effect->transport_bpm = g_transport_bpm;            
         return effect->transport_bpm;
     }
 
@@ -3266,7 +3269,7 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
 
         if (event.size != 3)
             continue;
-
+        printf("DEBUG: @@@ %u, %u\n", event.buffer[1], event.buffer[2]);
         // check if it's a Note message
         if(status_nibble == 0x80 || status_nibble == 0x90)
         {
