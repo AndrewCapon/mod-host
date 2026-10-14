@@ -2926,8 +2926,8 @@ static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres)
         if(needIncrement) 
         {
             value = 1+(*(port->buffer));
-            if(value > port->max_value)
-                value = port->min_value;
+            if(value > mcc->maximum)
+                value = mcc->minimum;
         } 
         else 
         {
