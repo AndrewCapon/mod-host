@@ -3269,7 +3269,6 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
 
         if (event.size != 3)
             continue;
-        printf("DEBUG: @@@ %u, %u\n", event.buffer[1], event.buffer[2]);
         // check if it's a Note message
         if(status_nibble == 0x80 || status_nibble == 0x90)
         {
