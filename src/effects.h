@@ -88,6 +88,7 @@ typedef enum {
     MIDI_CC_VARIABLE,
     MIDI_CC_MOMENTARY,
     MIDI_CC_TOGGLE,
+    MIDI_CC_INDEXED
 } MidiCCType;
 
 typedef enum {

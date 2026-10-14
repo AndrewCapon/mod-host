@@ -1189,7 +1189,9 @@ static int GetMidiOutValue(midi_cc_t *midiCC)
     if(bIsValid)
     {
         MidiType midiType = GetControllerMidiType(midiCC->controller);
-        if(MIDI_TYPE_NRPN == midiType || MIDI_TYPE_CC_14 == midiType)
+        if(midiCC->ccType == MIDI_CC_INDEXED)
+            midiValue = *(midiCC->port->buffer);
+        else if(MIDI_TYPE_NRPN == midiType || MIDI_TYPE_CC_14 == midiType)
             midiValue = fNormal * 16383;
         else
             midiValue = fNormal * 127;
@@ -2917,6 +2919,12 @@ static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres)
                 g_transport_reset = true;
             }
         }
+    }
+    else if ((port->hints & HINT_ENUMERATION) && (mcc->ccType == MIDI_CC_INDEXED))
+    {
+        value = mvalue;
+        if(value > mcc->maximum)
+            value = mcc->maximum;
     }
     else if ((port->hints & HINT_ENUMERATION) && (mcc->ccType != MIDI_CC_VARIABLE))
     {
