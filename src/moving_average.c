@@ -5,11 +5,12 @@
 
 void ma_reset(moving_average_data_t *ma)
 {
-  ma->average = 0.0f;
+  ma->average = 0.0;
+  ma->last = 0.0;
   ma->idx = 0;
   ma->count = 0;
   uint16_t u; for(u=0; u < ma->size ; u++)
-    ma->data[u] = 0.0f;
+    ma->data[u] = 0.0;
 }
 
 void ma_init(moving_average_data_t *ma, double *data, uint16_t size, bool alwaysAccurate)
@@ -25,7 +26,7 @@ void ma_add(moving_average_data_t *ma, double fValue)
 {
   double fRemoved = ma->data[ma->idx];
   ma->data[ma->idx] = fValue;
-  
+  ma->last = fValue;
   ma->count ++;
 
   if(ma->alwaysAccurate && ma->count <= ma->size )

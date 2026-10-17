@@ -7,6 +7,7 @@
 typedef struct _moving_average_data_t
 {
   double   average;
+  double   last;
   double   *data;
   uint16_t idx;
   uint16_t count;

@@ -1,6 +1,7 @@
 #include <sys/time.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <math.h>
 
 #include "tap_tempo.h"
 
@@ -27,8 +28,9 @@ double TapTempoUpdate(tap_tempo_t *tap_tempo, double current_bpm)
 	double        result = current_bpm;
 	unsigned long current_ms    = TapTempoGetCurrentMS();
 	double        interval_time = current_ms - tap_tempo->last_time;
+	double		  diff = tap_tempo->ma.last ? fabs(interval_time - tap_tempo->ma.last) : 0;
 
-	if(tap_tempo->last_time && (interval_time > TT_MAXTIME))
+	if(tap_tempo->last_time && ((interval_time > TT_MAXTIME) || (diff > TT_MAXDIFF)))
 		TapTempoInit(tap_tempo);
  
 	if(tap_tempo->last_time == 0)
