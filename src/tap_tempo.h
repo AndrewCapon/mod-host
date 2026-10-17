@@ -7,7 +7,7 @@
 
 #define TT_MAXTAPS (8)
 #define TT_MAXTIME (4000)
-#define TT_MAXDIFF (200)
+#define TT_MAXDIFF (100)
 #define TT_MIN_TEMPO (20)
 #define TT_MAX_TEMPO (280)
 
