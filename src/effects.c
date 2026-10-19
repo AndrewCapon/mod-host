@@ -831,6 +831,7 @@ static bool g_enable_midi_feedback;
 static bool g_enable_midi_feedback_sync;
 static bool g_enable_nrpn;
 static bool g_enable_multiple_controllers;
+static bool g_enable_midi_macros;
 
 
 static uint16_t  g_nrpn_param_num;
@@ -1038,6 +1039,12 @@ static MidiType GetControllerMidiType(uint16_t controller);
 static uint16_t EncodedControllerForController(uint16_t controller, MidiType midiType);
 static uint16_t ControllerForEncodedController(uint16_t controller);
 
+static bool isMidiInverted(midi_cc_t* mcc);
+static bool isMidiIndexed(midi_cc_t* mcc);
+static bool isMidVariable(midi_cc_t* mcc);
+static bool isMidToggle(midi_cc_t* mcc);
+static bool isMidMomentary(midi_cc_t* mcc);
+
 /*
 ************************************************************************************************************************
 *           LOCAL CONFIGURATION ERRORS
@@ -1183,7 +1190,10 @@ static int GetMidiOutValue(midi_cc_t *midiCC)
         float value = *(midiCC->port->buffer);
 
         float fRange = midiCC->maximum - midiCC->minimum;
-        fNormal = (value - midiCC->minimum) / fRange;
+        if(isMidiInverted(midiCC))
+            fNormal = (midiCC->maximum - (value - midiCC->minimum)) / fRange;
+        else
+            fNormal = (value - midiCC->minimum) / fRange;
     }
 
     if(bIsValid)
@@ -2820,6 +2830,33 @@ static bool SetPortValue(port_t *port, float value, int effect_id, bool is_bypas
 }
 
 // FIXME merge most of this with SetPortValue
+static bool isMidiInverted(midi_cc_t* mcc)
+{
+    return mcc->ccType == MIDI_CC_MOMENTARY_INVERTED || mcc->ccType == MIDI_CC_TOGGLE_INVERTED || mcc->ccType == MIDI_CC_VARIABLE_INVERTED;
+}
+
+static bool isMidiIndexed(midi_cc_t* mcc)
+{
+    return mcc->ccType == MIDI_CC_INDEXED;
+}
+
+static bool isMidVariable(midi_cc_t* mcc)
+{
+    return mcc->ccType == MIDI_CC_VARIABLE || mcc->ccType == MIDI_CC_VARIABLE_INVERTED;
+}
+
+static bool isMidToggle(midi_cc_t* mcc)
+{
+    return mcc->ccType == MIDI_CC_TOGGLE|| mcc->ccType == MIDI_CC_TOGGLE_INVERTED;
+}
+
+static bool isMidMomentary(midi_cc_t* mcc)
+{
+    return mcc->ccType == MIDI_CC_MOMENTARY || mcc->ccType == MIDI_CC_MOMENTARY_INVERTED;
+}
+
+
+
 static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres)
 {
     const uint16_t mvaluediv = highres ? 8192 : 64;
@@ -2829,7 +2866,7 @@ static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres)
         effect_t *effect = &g_effects[mcc->effect_id];
 
         bool bypassed;
-        if(mcc->ccType == MIDI_CC_MOMENTARY)
+        if(isMidMomentary(mcc))
         {
             // we switch on a on value
             if(mvalue > mvaluediv)
@@ -2840,6 +2877,10 @@ static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres)
         else
             bypassed = mvalue < mvaluediv;
 
+
+        if(isMidiInverted(mcc))
+            bypassed = !bypassed;
+
         effect->bypass = bypassed ? 1.0f : 0.0f;
 
         if (effect->enabled_index >= 0)
@@ -2848,12 +2889,12 @@ static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres)
         return bypassed ? 1.0f : 0.0f;
     }
 
-    if ((mcc->ccType !=  MIDI_CC_VARIABLE) && !strcmp(mcc->symbol, g_bpm_port_symbol))
+    if ((!isMidVariable(mcc)) && !strcmp(mcc->symbol, g_bpm_port_symbol))
     {
         // Tap Tempo code
         effect_t *effect = &g_effects[mcc->effect_id];
 
-        if(mcc->ccType == MIDI_CC_MOMENTARY)
+        if(isMidMomentary(mcc))
         {
             // we trigger only on a on value
             if(mvalue > mvaluediv)
@@ -2879,19 +2920,25 @@ static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres)
     }
     else if (port->hints & HINT_TOGGLE)
     {
-        if(mcc->ccType == MIDI_CC_MOMENTARY)
+        if(isMidMomentary(mcc))
         {
-            if(mvalue >= mvaluediv)
+            if(mvalue >= mvaluediv) {
                 value = (port->prev_value == port->max_value) ? port->min_value : port->max_value;
+            }
             else
                 value = port->prev_value;
         }
         else
-            value = mvalue >= mvaluediv ? port->max_value : port->min_value;
+        {
+            if(isMidiInverted(mcc))
+                value = mvalue >= mvaluediv ? port->min_value : port->max_value;
+            else
+                value = mvalue >= mvaluediv ? port->max_value : port->min_value;
+        }
 
         if (mcc->effect_id == GLOBAL_EFFECT_ID && !strcmp(mcc->symbol, g_rolling_port_symbol))
         {
-            if(mcc->ccType == MIDI_CC_MOMENTARY)
+            if(isMidMomentary(mcc))
             {
                 if((value == port->max_value) && (value != port->prev_value))
                 {
@@ -2907,7 +2954,13 @@ static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres)
             }
             else
             {
-                if (mvalue >= mvaluediv)
+                bool start = false;
+                if(isMidiInverted(mcc))
+                    start = mvalue < mvaluediv;
+                else
+                    start = mvalue >= mvaluediv;
+
+                if (start)
                 {
                     jack_transport_start(g_jack_global_client);
                 }
@@ -2920,26 +2973,51 @@ static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres)
             }
         }
     }
-    else if ((port->hints & HINT_ENUMERATION) && (mcc->ccType == MIDI_CC_INDEXED))
+    else if ((port->hints & HINT_ENUMERATION) && (isMidiIndexed(mcc)))
     {
-        value = mvalue;
+        if(isMidiInverted(mcc))
+            if(highres)
+                value = 16383 - mvalue;
+            else
+                value = 127 - mvalue;
+        else
+            value = mvalue;
+
         if(value > mcc->maximum)
             value = mcc->maximum;
     }
-    else if ((port->hints & HINT_ENUMERATION) && (mcc->ccType != MIDI_CC_VARIABLE))
+    else if ((port->hints & HINT_ENUMERATION) && (!isMidVariable(mcc)))
     {
         // always increment if toggle, if momentary increment when larger than half
-        bool needIncrement = mcc->ccType == MIDI_CC_TOGGLE ? true : mvalue > mvaluediv;
+        if(isMidiInverted(mcc))
+        {
+            bool needDecrement= isMidToggle(mcc) ? true : mvalue > mvaluediv;
 
-        if(needIncrement) 
+            if(needDecrement) 
+            {
+                value = (*(port->buffer))-1;
+                if(value < mcc->minimum)
+                    value = mcc->maximum;
+            } 
+            else 
+            {
+                value = *(port->buffer);
+            }
+        }
+        else
         {
-            value = 1+(*(port->buffer));
-            if(value > mcc->maximum)
-                value = mcc->minimum;
-        } 
-        else 
-        {
-            value = *(port->buffer);
+            bool needIncrement = isMidToggle(mcc) ? true : mvalue > mvaluediv;
+
+            if(needIncrement) 
+            {
+                value = 1+(*(port->buffer));
+                if(value > mcc->maximum)
+                    value = mcc->minimum;
+            } 
+            else 
+            {
+                value = *(port->buffer);
+            }
         }
     }
     else
@@ -2951,6 +3029,9 @@ static float UpdateValueFromMidi(midi_cc_t* mcc, uint16_t mvalue, bool highres)
             value /= 16383.0f;
         else
             value /= 127.0f;
+        
+        if(isMidiInverted(mcc))
+            value = 1 - value;
 
         // make sure bounds are correct
         if (value <= 0.0f)
@@ -3542,11 +3623,12 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
                     }
                 }
 
-                break;
+                if(!g_enable_midi_macros)
+                    break;
             }
         }
 
-        if (! handled)
+        if (!handled || g_enable_midi_macros)
         {
             int effect_id;
             const char* symbol;
@@ -4921,7 +5003,8 @@ int effects_init(void* client)
     g_enable_midi_feedback_sync = false;
     g_enable_nrpn = false;
     g_enable_multiple_controllers = false;
-    
+    g_enable_midi_macros = false;
+
     // setup nrpn 
     g_nrpn_param_num   = 0xC000; // top two bits signify that msb and lsb need setting
     g_nrpn_param_value = 0xC000; // top two bits signify that msb and lsb need setting
@@ -5460,6 +5543,8 @@ int effects_init(void* client)
     if(access("/data/multiple-controllers", F_OK) != -1) 
         effects_multiple_controllers_enable(true);
 
+    if(access("/data/midi-macros", F_OK) != -1) 
+        effects_midi_macros_enable(true);
 
 #ifdef MOD_IO_PROCESSING_ENABLED
     /* Connect to capture ports if avaiable */
@@ -9990,6 +10075,12 @@ int effects_midi_nrpn_enable(int enable)
 int effects_multiple_controllers_enable(int enable) 
 {
     g_enable_multiple_controllers = enable != 0;
+    return SUCCESS;
+}
+
+int effects_midi_macros_enable(int enable) 
+{
+    g_enable_midi_macros = enable != 0;
     return SUCCESS;
 }
 

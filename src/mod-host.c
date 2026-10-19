@@ -698,6 +698,8 @@ static void feature_enable(proto_t *proto)
         resp = effects_midi_nrpn_enable(enabled);
     else if (!strcmp(feature, "multiple-controllers"))
         resp = effects_multiple_controllers_enable(enabled);
+    else if (!strcmp(feature, "midi-macros"))
+        resp = effects_midi_macros_enable(enabled);
     else
         resp = ERR_INVALID_OPERATION;
 

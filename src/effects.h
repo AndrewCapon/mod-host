@@ -88,7 +88,11 @@ typedef enum {
     MIDI_CC_VARIABLE,
     MIDI_CC_MOMENTARY,
     MIDI_CC_TOGGLE,
-    MIDI_CC_INDEXED
+    MIDI_CC_INDEXED,
+    MIDI_CC_VARIABLE_INVERTED,
+    MIDI_CC_MOMENTARY_INVERTED,
+    MIDI_CC_TOGGLE_INVERTED,
+    MIDI_CC_INDEXED_INVERTED,
 } MidiCCType;
 
 typedef enum {
@@ -221,6 +225,7 @@ int effects_midi_feedback_enable(int enable);
 int effects_midi_feedback_sync_enable(int enable);
 int effects_midi_nrpn_enable(int enable);
 int effects_multiple_controllers_enable(int enable); 
+int effects_midi_macros_enable(int enable); 
 int effects_monitor_audio_levels(const char *source_port_name, int enable);
 int effects_monitor_cpu_load(int enable, int num_effects, int *effects);
 int effects_monitor_midi_control(int channel, int enable);
