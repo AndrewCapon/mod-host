@@ -1059,6 +1059,22 @@ static bool isMidVariable(midi_cc_t* mcc);
 static bool isMidToggle(midi_cc_t* mcc);
 static bool isMidMomentary(midi_cc_t* mcc);
 
+
+static midi_cc_t *add_midi_cc(int8_t channel, uint16_t controller, 
+                              int effect_id, const char* control_symbol, 
+                              float minimum, float maximum, MidiCCType ccType);
+
+static void      update_midi_cc(midi_cc_t *existing_mcc, int8_t channel, uint16_t controller, 
+                                float minimum, float maximum, MidiCCType ccType);
+
+static midi_cc_t *get_midi_cc(int8_t channel, uint16_t controller, bool is_cc, uint16_t *start_index);
+static midi_cc_t *get_midi_cc_by_effect_symbol(int effect_id, const char *control_symbol);
+static void      init_midi_cc(midi_cc_t *mcc, int effect_id);
+static void      init_midi_cc_list(void);
+static void      midi_cc_list_remove_effect(int effect_id);
+static void      midi_cc_list_remove_all(void);
+static midi_cc_t *get_midi_cc_needs_sending(uint16_t *start_index);
+
 /*
 ************************************************************************************************************************
 *           LOCAL CONFIGURATION ERRORS
@@ -3143,6 +3159,7 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
     uint16_t controller_14_msb = 0;
     bool possible_14_bit_msb;
     bool possible_14_bit_lsb;
+    bool is_cc;
     uint8_t status_nibble;
     uint16_t mvalue;
     float value;
@@ -3183,83 +3200,81 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
             jack_midi_clear_buffer(buf);
             bool error_sending = false;
 
-            for (int j = 0; j < MAX_MIDI_CC_ASSIGN; j++)
+            uint16_t  start_index = 0;
+            midi_cc_t *mcc = get_midi_cc_needs_sending(&start_index);
+            while(mcc)
             {
-                if (g_midi_cc_list[j].effect_id == ASSIGNMENT_NULL)
-                    break;
-                if (g_midi_cc_list[j].effect_id == ASSIGNMENT_UNUSED)
-                    continue;
-                if (g_midi_cc_list[j].midiOutValue >= 0)
+                MidiType midiType = GetControllerMidiType(mcc->controller);
+                uint16_t controller = ControllerForEncodedController(mcc->controller);
+                if(MIDI_TYPE_CC_14 == midiType)
                 {
-                    MidiType midiType = GetControllerMidiType(g_midi_cc_list[j].controller);
-                    uint16_t controller = ControllerForEncodedController(g_midi_cc_list[j].controller);
-                    if(MIDI_TYPE_CC_14 == midiType)
-                    {
-                        // 14 bit cc (0-31) MSB and LSB 32 above
-                        jack_midi_data_t buffer[3];
-                        buffer [0] = 0xb0 + g_midi_cc_list[j].channel;
-                        buffer [1] = controller;
-                        buffer [2] = g_midi_cc_list[j].midiOutValue>>7;
-                        error_sending = jack_midi_event_write(buf, 0, buffer, 3);
+                    // 14 bit cc (0-31) MSB and LSB 32 above
+                    jack_midi_data_t buffer[3];
+                    buffer [0] = 0xb0 + mcc->channel;
+                    buffer [1] = controller;
+                    buffer [2] = mcc->midiOutValue>>7;
+                    error_sending = jack_midi_event_write(buf, 0, buffer, 3);
 
-                        buffer [0] = 0xb0 + g_midi_cc_list[j].channel;
-                        buffer [1] = 32 + controller;
-                        buffer [2] = g_midi_cc_list[j].midiOutValue & 0x007F;
-                        g_midi_cc_list[j].midiOutValue = -1;
-                        error_sending = jack_midi_event_write(buf, 0, buffer, 3);
-                    }
-                    else if(MIDI_TYPE_NOTE == midiType) {
-                        // Simple note on and off
-                        jack_midi_data_t buffer[3];
-                        if(g_midi_cc_list[j].midiOutValue == 0)
-                            buffer [0] = 0x80 + g_midi_cc_list[j].channel;
-                        else
-                            buffer [0] = 0x90 + g_midi_cc_list[j].channel;
-
-                        buffer [1] = g_midi_cc_list[j].controller;
-                        buffer [2] = g_midi_cc_list[j].midiOutValue;
-                        g_midi_cc_list[j].midiOutValue = -1;
-                        error_sending = jack_midi_event_write(buf, 0, buffer, 3);
-                    }
-                    else if(MIDI_TYPE_NRPN == midiType)
-                    {
-                        if(g_enable_nrpn)
-                        {
-                            // the controller is an nrpn, send 4 events for the nrpn
-                            // uint16_t controller = g_midi_cc_list[j].controller & 0x7FFF;
-
-                            jack_midi_data_t ccs[4] = {99, 98, 6, 38};
-                            jack_midi_data_t data[4] = {controller >> 7, controller & 0x007F, g_midi_cc_list[j].midiOutValue >> 7, g_midi_cc_list[j].midiOutValue & 0x007F};
-
-                            jack_midi_data_t buffer[3];
-                            
-                            buffer [0] = 0xb0 + g_midi_cc_list[j].channel;
-
-                            for(uint_fast8_t b = 0; b < 4; b++)
-                            {
-                                buffer [1] = ccs[b];
-                                buffer [2] = data[b];
-                                error_sending = jack_midi_event_write(buf, 0, buffer, 3);
-                            }
-                        }
-                        g_midi_cc_list[j].midiOutValue = -1;
-                    }
+                    buffer [0] = 0xb0 + mcc->channel;
+                    buffer [1] = 32 + controller;
+                    buffer [2] = mcc->midiOutValue & 0x007F;
+                    mcc->midiOutValue = -1;
+                    error_sending = jack_midi_event_write(buf, 0, buffer, 3);
+                }
+                else if(MIDI_TYPE_NOTE == midiType) {
+                    // Simple note on and off
+                    jack_midi_data_t buffer[3];
+                    if(mcc->midiOutValue == 0)
+                        buffer [0] = 0x80 + mcc->channel;
                     else
+                        buffer [0] = 0x90 + mcc->channel;
+
+                    buffer [1] = mcc->controller;
+                    buffer [2] = mcc->midiOutValue;
+                    mcc->midiOutValue = -1;
+                    error_sending = jack_midi_event_write(buf, 0, buffer, 3);
+                }
+                else if(MIDI_TYPE_NRPN == midiType)
+                {
+                    if(g_enable_nrpn)
                     {
+                        // the controller is an nrpn, send 4 events for the nrpn
+                        // uint16_t controller = mcc->controller & 0x7FFF;
+
+                        jack_midi_data_t ccs[4] = {99, 98, 6, 38};
+                        jack_midi_data_t data[4] = {controller >> 7, controller & 0x007F, mcc->midiOutValue >> 7, mcc->midiOutValue & 0x007F};
+
                         jack_midi_data_t buffer[3];
-                        buffer [0] = 0xb0 + g_midi_cc_list[j].channel;
-                        buffer [1] = g_midi_cc_list[j].controller;
-                        buffer [2] = g_midi_cc_list[j].midiOutValue;
-                        g_midi_cc_list[j].midiOutValue = -1;
-                        error_sending = jack_midi_event_write(buf, 0, buffer, 3);
+                        
+                        buffer [0] = 0xb0 + mcc->channel;
+
+                        for(uint_fast8_t b = 0; b < 4; b++)
+                        {
+                            buffer [1] = ccs[b];
+                            buffer [2] = data[b];
+                            error_sending = jack_midi_event_write(buf, 0, buffer, 3);
+                        }
                     }
+                    mcc->midiOutValue = -1;
+                }
+                else
+                {
+                    jack_midi_data_t buffer[3];
+                    buffer [0] = 0xb0 + mcc->channel;
+                    buffer [1] = mcc->controller;
+                    buffer [2] = mcc->midiOutValue;
+                    mcc->midiOutValue = -1;
+                    error_sending = jack_midi_event_write(buf, 0, buffer, 3);
                 }
 
                 if(error_sending)
-                    break;
+                    mcc = NULL;
+                else
+                    mcc = get_midi_cc_needs_sending(&start_index);
             }
         }
     }
+
     // Handle input MIDI events
     void *const port_buf = jack_port_get_buffer(g_midi_in_port, nframes);
     const jack_nframes_t event_count = jack_midi_get_event_count(port_buf);
@@ -3271,6 +3286,7 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
 
         possible_14_bit_msb = false;
         possible_14_bit_lsb = false;
+        is_cc = false;
 
         // Handle MIDI Beat Clock
         if (g_transport_sync_mode == TRANSPORT_SYNC_MIDI)
@@ -3426,7 +3442,7 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
             controller = event.buffer[1];
             mvalue     = event.buffer[2];
             highres    = false;
-
+            is_cc      = true;
             if(controller < 32)
             {
                 controller_14_msb = EncodedControllerForController(controller, MIDI_TYPE_CC_14);
@@ -3510,36 +3526,27 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
             case 89:
                 if (! g_monitored_midi_programs[channel])
                     continue;
-
-                for (int j = 0; j < MAX_MIDI_CC_ASSIGN; j++)
+                uint16_t start_index = 0;
+                const midi_cc_t *mcc = get_midi_cc(int8_t channel, uint16_t controller, false, &start_index)
+                if(mcc)
                 {
-                    if (g_midi_cc_list[j].effect_id == ASSIGNMENT_NULL)
-                        break;
-                    if (g_midi_cc_list[j].effect_id == ASSIGNMENT_UNUSED)
-                        continue;
+                    handled = true;
+                    value = UpdateValueFromMidi(&mcc->, mvalue, highres);
 
-                    if (g_midi_cc_list[j].controller == controller)
+                    postponed_event_list_data* const posteventptr = rtsafe_memory_pool_allocate_atomic(g_rtsafe_mem_pool);
+
+                    if (posteventptr)
                     {
-                        handled = true;
-                        value = UpdateValueFromMidi(&g_midi_cc_list[j], mvalue, highres);
+                        posteventptr->event.type = POSTPONED_PARAM_SET;
+                        posteventptr->event.parameter.effect_id = mcc->effect_id;
+                        posteventptr->event.parameter.symbol    = mcc->symbol;
+                        posteventptr->event.parameter.value     = value;
 
-                        postponed_event_list_data* const posteventptr = rtsafe_memory_pool_allocate_atomic(g_rtsafe_mem_pool);
+                        pthread_mutex_lock(&g_rtsafe_mutex);
+                        list_add_tail(&posteventptr->siblings, &g_rtsafe_list);
+                        pthread_mutex_unlock(&g_rtsafe_mutex);
 
-                        if (posteventptr)
-                        {
-                            posteventptr->event.type = POSTPONED_PARAM_SET;
-                            posteventptr->event.parameter.effect_id = g_midi_cc_list[j].effect_id;
-                            posteventptr->event.parameter.symbol    = g_midi_cc_list[j].symbol;
-                            posteventptr->event.parameter.value     = value;
-
-                            pthread_mutex_lock(&g_rtsafe_mutex);
-                            list_add_tail(&posteventptr->siblings, &g_rtsafe_list);
-                            pthread_mutex_unlock(&g_rtsafe_mutex);
-
-                            needs_post = true;
-                        }
-
-                        break;
+                        needs_post = true;
                     }
                 }
 
@@ -3590,37 +3597,25 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
         handled = false;
         channel = (event.buffer[0] & 0x0F);
 
-        for (int j = 0; j < MAX_MIDI_CC_ASSIGN; j++)
+        uint16_t start_index = 0;
+        midi_cc_t *mcc = get_midi_cc(channel, controller, is_cc, &start_index);
+        while(mcc)
         {
-            if (g_midi_cc_list[j].effect_id == ASSIGNMENT_NULL)
-                break;
-            if (g_midi_cc_list[j].effect_id == ASSIGNMENT_UNUSED)
-                continue;
-
-#ifdef _DARKGLASS_PABLITO
-            if (! g_monitored_midi_programs[channel])
-                continue;
-#else
-            if (g_midi_cc_list[j].channel != channel)
-                continue;
-#endif
-
-            // TODO: avoid race condition against effects_midi_unmap
-            if (possible_14_bit_msb && g_midi_cc_list[j].controller == controller_14_msb)
+            if (possible_14_bit_msb && mcc->controller == controller_14_msb)
             {
                 printf("DEBUG: got 14 bit MSB\n");
                 handled = true;
-                g_midi_cc_list[j].possible_14_value = mvalue<<7;
+                mcc->possible_14_value = mvalue<<7;
             }
-            else if (possible_14_bit_lsb && g_midi_cc_list[j].controller == controller_14_msb)
+            else if (possible_14_bit_lsb && mcc->controller == controller_14_msb)
             {
                 printf("DEBUG: got 14 bit LSB\n");
                 handled = true;
-                g_midi_cc_list[j].possible_14_value += mvalue;
-                mvalue = g_midi_cc_list[j].possible_14_value;
+                mcc->possible_14_value += mvalue;
+                mvalue = mcc->possible_14_value;
 
-                float oldValue = g_midi_cc_list[j].port ? g_midi_cc_list[j].port->prev_value : NAN;
-                value = UpdateValueFromMidi(&g_midi_cc_list[j], mvalue, true);
+                float oldValue = mcc->port ? mcc->port->prev_value : NAN;
+                value = UpdateValueFromMidi(mcc, mvalue, true);
                 printf("DEBUG: 14 bit = %u, value = %f oldValue = %f\n", mvalue, value, oldValue);
                 // only set param if value actually changed
                 if(oldValue != value)
@@ -3628,15 +3623,15 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
                     // if midi feedback sync is enabled set the output CC to send back out over midi
                     // this will keep any other devices synced.
                     if(g_enable_midi_feedback_sync)
-                        SetMidiOutValue(&(g_midi_cc_list[j])); // TODO this is wrong for 14 bit cc
+                        SetMidiOutValue(mcc); // TODO this is wrong for 14 bit cc
 
                     postponed_event_list_data* const posteventptr = rtsafe_memory_pool_allocate_atomic(g_rtsafe_mem_pool);
 
                     if (posteventptr)
                     {
                         posteventptr->event.type = POSTPONED_PARAM_SET;
-                        posteventptr->event.parameter.effect_id = g_midi_cc_list[j].effect_id;
-                        posteventptr->event.parameter.symbol    = g_midi_cc_list[j].symbol;
+                        posteventptr->event.parameter.effect_id = mcc->effect_id;
+                        posteventptr->event.parameter.symbol    = mcc->symbol;
                         posteventptr->event.parameter.value     = value;
 
                         pthread_mutex_lock(&g_rtsafe_mutex);
@@ -3647,11 +3642,11 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
                     }
                 }
             }
-            else if (g_midi_cc_list[j].controller == controller)
+            else
             {
                 handled = true;
-                float oldValue = g_midi_cc_list[j].port ? g_midi_cc_list[j].port->prev_value : NAN;
-                value = UpdateValueFromMidi(&g_midi_cc_list[j], mvalue, highres);
+                float oldValue = mcc->port ? mcc->port->prev_value : NAN;
+                value = UpdateValueFromMidi(mcc, mvalue, highres);
 
                 // only set param if value actually changed
                 if(oldValue != value)
@@ -3659,15 +3654,15 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
                     // if midi feedback sync is enabled set the output CC to send back out over midi
                     // this will keep any other devices synced.
                     if(g_enable_midi_feedback_sync)
-                        SetMidiOutValue(&(g_midi_cc_list[j]));
+                        SetMidiOutValue(mcc);
 
                     postponed_event_list_data* const posteventptr = rtsafe_memory_pool_allocate_atomic(g_rtsafe_mem_pool);
 
                     if (posteventptr)
                     {
                         posteventptr->event.type = POSTPONED_PARAM_SET;
-                        posteventptr->event.parameter.effect_id = g_midi_cc_list[j].effect_id;
-                        posteventptr->event.parameter.symbol    = g_midi_cc_list[j].symbol;
+                        posteventptr->event.parameter.effect_id = mcc->effect_id;
+                        posteventptr->event.parameter.symbol    = mcc->symbol;
                         posteventptr->event.parameter.value     = value;
 
                         pthread_mutex_lock(&g_rtsafe_mutex);
@@ -3677,10 +3672,12 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
                         needs_post = true;
                     }
                 }
-
-                if(!g_enable_midi_macros)
-                    break;
             }
+            // get next one if using macros
+            if(g_enable_midi_macros)
+                mcc = get_midi_cc(channel, controller, is_cc, &start_index);
+            else
+                mcc = NULL;
         }
 
         if (!handled || g_enable_midi_macros)
@@ -5542,19 +5539,8 @@ int effects_init(void* client)
     lv2_atom_forge_init(&g_lv2_atom_forge, &g_urid_map);
 
     /* Init the midi variables */
-    for (int i = 0; i < MAX_MIDI_CC_ASSIGN; i++)
-    {
-        g_midi_cc_list[i].channel = -1;
-        g_midi_cc_list[i].controller = 0;
-        g_midi_cc_list[i].minimum = 0.0f;
-        g_midi_cc_list[i].maximum = 1.0f;
-        g_midi_cc_list[i].effect_id = ASSIGNMENT_NULL;
-        g_midi_cc_list[i].symbol = NULL;
-        g_midi_cc_list[i].port = NULL;
-        g_midi_cc_list[i].midiOutValue = -1;
-        g_midi_cc_list[i].ccType = MIDI_CC_VARIABLE;
-        g_midi_cc_list[i].possible_14_value = 0;
-    }
+    init_midi_cc_list();
+
     g_midi_learning = NULL;
 
     /* init tap tempo from midi */
@@ -6873,26 +6859,7 @@ static void effects_remove_inner_pre(int effect_id)
         g_midi_learning = NULL;
         pthread_mutex_unlock(&g_midi_learning_mutex);
 
-        for (int j = MAX_MIDI_CC_ASSIGN, unused = ASSIGNMENT_NULL; --j >= 0;)
-        {
-            #ifdef _DARKGLASS_PABLITO
-            if (g_midi_cc_list[j].effect_id >= MAX_PLUGIN_INSTANCES && g_midi_cc_list[j].effect_id < MAX_INSTANCES)
-            {
-                unused = ASSIGNMENT_UNUSED;
-                continue;
-            }
-            #endif
-            g_midi_cc_list[j].channel = -1;
-            g_midi_cc_list[j].controller = 0;
-            g_midi_cc_list[j].minimum = 0.0f;
-            g_midi_cc_list[j].maximum = 1.0f;
-            g_midi_cc_list[j].effect_id = unused;
-            g_midi_cc_list[j].symbol = NULL;
-            g_midi_cc_list[j].port = NULL;
-            g_midi_cc_list[j].midiOutValue = -1;
-            g_midi_cc_list[j].ccType = MIDI_CC_VARIABLE;
-            g_midi_cc_list[j].possible_14_value = 0;
-        }
+        midi_cc_list_remove_all();
         
 #ifdef HAVE_CONTROLCHAIN
         if (g_cc_client)
@@ -6998,26 +6965,7 @@ static void effects_remove_inner_pre(int effect_id)
         }
         pthread_mutex_unlock(&g_midi_learning_mutex);
 
-        for (int j = 0; j < MAX_MIDI_CC_ASSIGN; j++)
-        {
-            if (g_midi_cc_list[j].effect_id == ASSIGNMENT_NULL)
-                break;
-            if (g_midi_cc_list[j].effect_id == ASSIGNMENT_UNUSED)
-                continue;
-            if (g_midi_cc_list[j].effect_id != effect_id)
-                continue;
-
-            g_midi_cc_list[j].effect_id = ASSIGNMENT_UNUSED;
-            g_midi_cc_list[j].channel = -1;
-            g_midi_cc_list[j].controller = 0;
-            g_midi_cc_list[j].minimum = 0.0f;
-            g_midi_cc_list[j].maximum = 1.0f;
-            g_midi_cc_list[j].symbol = NULL;
-            g_midi_cc_list[j].port = NULL;
-            g_midi_cc_list[j].midiOutValue = -1;
-            g_midi_cc_list[j].ccType = MIDI_CC_VARIABLE;
-            g_midi_cc_list[j].possible_14_value = 0;
-        }
+        midi_cc_list_remove_effect(effect_id);
 
 #ifdef HAVE_CONTROLCHAIN
         for (int i = 0; i < CC_MAX_DEVICES; i++)
@@ -7584,39 +7532,10 @@ int effects_disconnect_all(const char *port)
     return ret;
 }
 
-midi_cc_t *effects_get_midi_cc(int effect_id, const char *control_symbol)
-{
-    // TODO : we really should change the way this is all stored
-    //        this code is all rather expensive and there is loads of it everywhere
-    midi_cc_t *result = NULL;
-
-    for (int j = 0; j < MAX_MIDI_CC_ASSIGN; j++)
-    {
-        if (g_midi_cc_list[j].effect_id == ASSIGNMENT_NULL)
-            break;
-        if (g_midi_cc_list[j].effect_id == ASSIGNMENT_UNUSED)
-            continue;
-        if (g_midi_cc_list[j].effect_id  == effect_id)
-        { 
-            // avoid call to strcmp and compare strings ourselves
-            bool bEqual = false;
-            for(const char *s1 = control_symbol, *s2 = g_midi_cc_list[j].symbol; (bEqual = *s1 == *s2) && *s1; s1++, s2++)
-                /* empty loop*/;
-
-            if(bEqual)
-            {
-                result = &(g_midi_cc_list[j]);
-                break;
-            }
-        }
-    }
-
-    return result;
-}
 
 void effects_send_midi_feedback(int effect_id, const char *control_symbol)
 {
-    midi_cc_t *midi_cc =effects_get_midi_cc(effect_id, control_symbol);
+    midi_cc_t *midi_cc = get_midi_cc_by_effect_symbol(effect_id, control_symbol);
     if(midi_cc)
         SetMidiOutValue(midi_cc);
 }
@@ -8548,8 +8467,6 @@ int effects_get_parameter_info(int effect_id, const char *control_symbol, float 
 
 int effects_midi_learn(int effect_id, const char *control_symbol, float minimum, float maximum)
 {
-    port_t *port;
-
     if (!InstanceExist(effect_id))
     {
         return ERR_INSTANCE_NON_EXISTS;
@@ -8557,6 +8474,7 @@ int effects_midi_learn(int effect_id, const char *control_symbol, float minimum,
 
     const bool is_bypass = !strcmp(control_symbol, g_bypass_port_symbol);
 
+    // clear old midi learning
     pthread_mutex_lock(&g_midi_learning_mutex);
     if (g_midi_learning != NULL)
     {
@@ -8568,154 +8486,81 @@ int effects_midi_learn(int effect_id, const char *control_symbol, float minimum,
     pthread_mutex_unlock(&g_midi_learning_mutex);
 
     // if already mapped set it to re-learn
-    for (int i = 0; i < MAX_MIDI_CC_ASSIGN; i++)
+    midi_cc_t *existing_mcc = get_midi_cc_by_effect_symbol(effect_id, control_symbol);
+    if(existing_mcc)
     {
-        if (g_midi_cc_list[i].effect_id == ASSIGNMENT_NULL)
-            break;
-        if (g_midi_cc_list[i].effect_id == ASSIGNMENT_UNUSED)
-            continue;
-        if (g_midi_cc_list[i].effect_id != effect_id)
-            continue;
-        if (strcmp(g_midi_cc_list[i].symbol, control_symbol))
-            continue;
-
-        g_midi_cc_list[i].channel = -1;
-        g_midi_cc_list[i].controller = 0;
-
-        if (!is_bypass)
+        if(is_bypass)
         {
-            g_midi_cc_list[i].minimum = minimum;
-            g_midi_cc_list[i].maximum = maximum;
-        }
-
-        pthread_mutex_lock(&g_midi_learning_mutex);
-        g_midi_learning = &g_midi_cc_list[i];
-        pthread_mutex_unlock(&g_midi_learning_mutex);
-        return SUCCESS;
-    }
-
-    // Otherwise locate a free position on list and take it
-    for (int i = 0; i < MAX_MIDI_CC_ASSIGN; i++)
-    {
-        if (INSTANCE_IS_VALID(g_midi_cc_list[i].effect_id))
-            continue;
-
-        if (is_bypass)
-        {
-            g_midi_cc_list[i].symbol = g_bypass_port_symbol;
-            g_midi_cc_list[i].port = NULL;
+            update_midi_cc(existing_mcc, -1, 0, 0, 1, MIDI_CC_VARIABLE);
         }
         else
         {
-            port = FindEffectInputPortBySymbol(&(g_effects[effect_id]), control_symbol);
-
-            if (port == NULL)
-                return ERR_LV2_INVALID_PARAM_SYMBOL;
-
-            g_midi_cc_list[i].minimum = minimum;
-            g_midi_cc_list[i].maximum = maximum;
-            g_midi_cc_list[i].symbol = port->symbol;
-            g_midi_cc_list[i].port = port;
+            update_midi_cc(existing_mcc, -1, 0, minimum, maximum, MIDI_CC_VARIABLE);
         }
 
-        g_midi_cc_list[i].channel = -1;
-        g_midi_cc_list[i].controller = 0;
-        g_midi_cc_list[i].effect_id = effect_id;
-
         pthread_mutex_lock(&g_midi_learning_mutex);
-        g_midi_learning = &g_midi_cc_list[i];
+        g_midi_learning = existing_mcc;
         pthread_mutex_unlock(&g_midi_learning_mutex);
         return SUCCESS;
     }
 
-    return ERR_ASSIGNMENT_LIST_FULL;
+    // Otherwise add a new mcc
+    midi_cc_t *new_mcc = add_midi_cc(-1, 0, effect_id, control_symbol, minimum, maximum, MIDI_CC_VARIABLE);
+    if(new_mcc)
+    {
+        pthread_mutex_lock(&g_midi_learning_mutex);
+        g_midi_learning = new_mcc;
+        pthread_mutex_unlock(&g_midi_learning_mutex);
+        return SUCCESS;
+    }
+    else
+    {
+        return ERR_ASSIGNMENT_LIST_FULL;
+    }
 }
 
 int effects_midi_map(int effect_id, const char *control_symbol, int channel, int controller, float minimum, float maximum, MidiCCType ccType)
 {
-    port_t *port;
-
     if (!InstanceExist(effect_id))
     {
         return ERR_INSTANCE_NON_EXISTS;
     }
 
     const bool is_bypass = !strcmp(control_symbol, g_bypass_port_symbol);
-    const bool is_preset = !strcmp(control_symbol, g_presets_port_symbol);
 
     // update current mapping first if it exists
-    for (int i = 0; i < MAX_MIDI_CC_ASSIGN; i++)
+    midi_cc_t *existing_mcc = get_midi_cc_by_effect_symbol(effect_id, control_symbol);
+    if(existing_mcc)
     {
-        if (g_midi_cc_list[i].effect_id == ASSIGNMENT_NULL)
-            break;
-        if (g_midi_cc_list[i].effect_id == ASSIGNMENT_UNUSED)
-            continue;
-        if (g_midi_cc_list[i].effect_id != effect_id)
-            continue;
-        if (strcmp(g_midi_cc_list[i].symbol, control_symbol))
-            continue;
-
-        g_midi_cc_list[i].channel = channel;
-        g_midi_cc_list[i].controller = controller;
-        g_midi_cc_list[i].ccType = ccType;
-        g_midi_cc_list[i].possible_14_value = 0;
-
-        if (!is_bypass)
+        if(is_bypass)
         {
-            g_midi_cc_list[i].minimum = minimum;
-            g_midi_cc_list[i].maximum = maximum;
-        
-            // if midi feedback is enabled set this cc to be sent
-            if(g_enable_midi_feedback)
-                SetMidiOutValue(&(g_midi_cc_list[i]));
-        }
-
-        return SUCCESS;
-    }
-
-    // Otherwise locate a free position on list and take it
-    for (int i = 0; i < MAX_MIDI_CC_ASSIGN; i++)
-    {
-        if (INSTANCE_IS_VALID(g_midi_cc_list[i].effect_id))
-            continue;
-
-        g_midi_cc_list[i].channel = channel;
-        g_midi_cc_list[i].controller = controller;
-        g_midi_cc_list[i].effect_id = effect_id;
-        g_midi_cc_list[i].ccType = ccType;
-        g_midi_cc_list[i].possible_14_value = 0;
-
-        if (is_bypass)
-        {
-            g_midi_cc_list[i].symbol = g_bypass_port_symbol;
-            g_midi_cc_list[i].port = NULL;
+            update_midi_cc(existing_mcc, channel, controller, 0, 1, ccType);
         }
         else
         {
-            port = FindEffectInputPortBySymbol(&(g_effects[effect_id]), control_symbol);
-
-            if (port == NULL)
-                return ERR_LV2_INVALID_PARAM_SYMBOL;
-
-            g_midi_cc_list[i].minimum = minimum;
-            g_midi_cc_list[i].maximum = maximum;
-            g_midi_cc_list[i].symbol = port->symbol;
-            g_midi_cc_list[i].port = port;
-
-            if(is_preset) {
-                port->min_value = minimum;
-                port->max_value = maximum;
-            }
+            update_midi_cc(existing_mcc, channel, controller, minimum, maximum, ccType);
 
             // if midi feedback is enabled set this cc to be sent
             if(g_enable_midi_feedback)
-                SetMidiOutValue(&(g_midi_cc_list[i]));
+                SetMidiOutValue(existing_mcc);
         }
-
         return SUCCESS;
     }
 
-    return ERR_ASSIGNMENT_LIST_FULL;
+    // Otherwise add a new midi cc
+    midi_cc_t *new_mcc = add_midi_cc(channel, controller, effect_id, control_symbol, minimum, maximum, ccType);
+    if(new_mcc)
+    {
+        // if midi feedback is enabled set this cc to be sent
+        if(g_enable_midi_feedback)
+            SetMidiOutValue(new_mcc);
+
+        return SUCCESS;
+    }
+    else
+    {
+        return ERR_ASSIGNMENT_LIST_FULL;
+    }
 }
 
 int effects_midi_unmap(int effect_id, const char *control_symbol)
@@ -8725,32 +8570,15 @@ int effects_midi_unmap(int effect_id, const char *control_symbol)
         return ERR_INSTANCE_NON_EXISTS;
     }
 
-    for (int i = 0; i < MAX_MIDI_CC_ASSIGN; i++)
+    midi_cc_t *mcc = get_midi_cc_by_effect_symbol(effect_id, control_symbol);
+    if(mcc)
     {
-        if (g_midi_cc_list[i].effect_id == ASSIGNMENT_NULL)
-            break;
-        if (g_midi_cc_list[i].effect_id == ASSIGNMENT_UNUSED)
-            continue;
-        if (g_midi_cc_list[i].effect_id != effect_id)
-            continue;
-        if (strcmp(g_midi_cc_list[i].symbol, control_symbol))
-            continue;
-
         pthread_mutex_lock(&g_midi_learning_mutex);
-        if (g_midi_learning == &g_midi_cc_list[i])
+        if (g_midi_learning == mcc)
             g_midi_learning = NULL;
         pthread_mutex_unlock(&g_midi_learning_mutex);
 
-        g_midi_cc_list[i].channel = -1;
-        g_midi_cc_list[i].controller = 0;
-        g_midi_cc_list[i].minimum = 0.0f;
-        g_midi_cc_list[i].maximum = 1.0f;
-        g_midi_cc_list[i].effect_id = ASSIGNMENT_UNUSED;
-        g_midi_cc_list[i].symbol = NULL;
-        g_midi_cc_list[i].port = NULL;
-        g_midi_cc_list[i].midiOutValue = -1;
-        g_midi_cc_list[i].ccType = MIDI_CC_VARIABLE;
-        g_midi_cc_list[i].possible_14_value = 0;
+        init_midi_cc(mcc, ASSIGNMENT_UNUSED);
 
         return SUCCESS;
     }
@@ -10656,3 +10484,215 @@ void effects_idle_external_uis(void)
     }
 #endif
 }
+
+
+// refactored midi cc functions
+midi_cc_t *add_midi_cc(int8_t channel, uint16_t controller, 
+                       int effect_id, const char* control_symbol, 
+                       float minimum, float maximum, MidiCCType ccType)
+{
+    for (int i = 0; i < MAX_MIDI_CC_ASSIGN; i++)
+    {
+        midi_cc_t *mcc = &g_midi_cc_list[i];
+        if (INSTANCE_IS_VALID(mcc->effect_id))
+            continue;
+
+        mcc->channel = channel;
+        mcc->controller = controller;
+        mcc->effect_id = effect_id;
+        mcc->ccType = ccType;
+        mcc->possible_14_value = 0;
+
+        if (strcmp(control_symbol, g_bypass_port_symbol) == 0)
+        {
+            mcc->symbol = g_bypass_port_symbol;
+            mcc->port = NULL;
+        }
+        else
+        {
+            port_t *port = FindEffectInputPortBySymbol(&(g_effects[effect_id]), control_symbol);
+
+            if (port == NULL)
+                return NULL;
+
+            mcc->minimum = minimum;
+            mcc->maximum = maximum;
+            mcc->symbol = port->symbol;
+            mcc->port = port;
+
+            if (strcmp(control_symbol, g_presets_port_symbol) == 0) 
+            {
+                port->min_value = minimum;
+                port->max_value = maximum;
+            }
+        }
+
+        return mcc;
+    }
+
+    return NULL;
+}
+
+midi_cc_t *get_midi_cc(int8_t channel, uint16_t controller, bool is_cc, uint16_t *start_index)
+{
+    midi_cc_t *result = NULL;
+
+    uint16_t cc_14_bit_controller = controller;
+    if(is_cc)
+    {
+        if(controller < 32)
+            cc_14_bit_controller = EncodedControllerForController(controller, MIDI_TYPE_CC_14);
+        else if (controller >= 32 && controller < 64)
+            cc_14_bit_controller = EncodedControllerForController(controller-32, MIDI_TYPE_CC_14);
+    }
+
+    for (int j = *start_index; (j < MAX_MIDI_CC_ASSIGN) && (!result); j++)
+    {
+        midi_cc_t* mcc = &g_midi_cc_list[j];
+        if (mcc->effect_id == ASSIGNMENT_NULL)
+            break;
+        if (mcc->effect_id == ASSIGNMENT_UNUSED)
+            continue;
+        
+        bool found = (mcc->channel == channel && mcc->controller == controller);
+
+        if(!found && (cc_14_bit_controller != controller))
+            found  = (mcc->channel == channel && mcc->controller == cc_14_bit_controller);
+
+        if (found)
+        {
+            result = mcc;
+            *start_index = j+1;
+        }
+    }
+
+    return result;
+}
+
+midi_cc_t *get_midi_cc_needs_sending(uint16_t *start_index)
+{
+    midi_cc_t *result = NULL;
+
+    for (int j = *start_index; (j < MAX_MIDI_CC_ASSIGN) && (!result); j++)
+    {
+        midi_cc_t* mcc = &g_midi_cc_list[j];
+        if (mcc->effect_id == ASSIGNMENT_NULL)
+            break;
+        if (mcc->effect_id == ASSIGNMENT_UNUSED)
+            continue;
+
+        if (mcc->midiOutValue >= 0)
+        {
+            result = mcc;
+            *start_index = j+1;
+        }
+    }
+
+    return result;
+}
+
+midi_cc_t *get_midi_cc_by_effect_symbol(int effect_id, const char *control_symbol)
+{
+    midi_cc_t *result = NULL;
+
+    for (int j = 0; (j < MAX_MIDI_CC_ASSIGN) && (!result); j++)
+    {
+        midi_cc_t *mcc = &g_midi_cc_list[j];
+        if (mcc->effect_id == ASSIGNMENT_NULL)
+            break;
+        if (mcc->effect_id == ASSIGNMENT_UNUSED)
+            continue;
+        if (mcc->effect_id  == effect_id)
+        { 
+            // avoid call to strcmp and compare strings ourselves
+            bool bEqual = false;
+            for(const char *s1 = control_symbol, *s2 = mcc->symbol; (bEqual = *s1 == *s2) && *s1; s1++, s2++)
+                /* empty loop*/;
+
+            if(bEqual)
+                result = mcc;
+        }
+    }
+
+    return result;
+}
+
+void update_midi_cc(midi_cc_t *existing_mcc, int8_t channel, uint16_t controller, 
+                     float minimum, float maximum, MidiCCType ccType)
+{
+    existing_mcc->channel = channel;
+    existing_mcc->controller = controller;
+    existing_mcc->ccType = ccType;
+    existing_mcc->possible_14_value = 0;
+    existing_mcc->minimum = minimum;
+    existing_mcc->maximum = maximum;
+}
+
+void init_midi_cc(midi_cc_t *mcc, int effect_id)
+{
+    mcc->channel = -1;
+    mcc->controller = 0;
+    mcc->minimum = 0.0f;
+    mcc->maximum = 1.0f;
+    mcc->effect_id = effect_id;
+    mcc->symbol = NULL;
+    mcc->port = NULL;
+    mcc->midiOutValue = -1;
+    mcc->ccType = MIDI_CC_VARIABLE;
+    mcc->possible_14_value = 0;
+}
+
+void init_midi_cc_list(void)
+{
+    for (int i = 0; i < MAX_MIDI_CC_ASSIGN; i++)
+    {
+        midi_cc_t *mcc = &g_midi_cc_list[i];
+        init_midi_cc(mcc, ASSIGNMENT_NULL);
+    }
+}
+
+void midi_cc_list_remove_effect(int effect_id)
+{
+    for (int j = 0; j < MAX_MIDI_CC_ASSIGN; j++)
+    {
+        midi_cc_t *mcc = &g_midi_cc_list[j];
+        if (mcc->effect_id == ASSIGNMENT_NULL)
+            break;
+        if (mcc->effect_id == ASSIGNMENT_UNUSED)
+            continue;
+        if (mcc->effect_id != effect_id)
+            continue;
+
+        init_midi_cc(mcc, ASSIGNMENT_UNUSED);
+    }
+}
+
+void midi_cc_list_remove_all(void)
+{
+    for (int j = MAX_MIDI_CC_ASSIGN, unused = ASSIGNMENT_NULL; --j >= 0;)
+    {
+        midi_cc_t *mcc = &g_midi_cc_list[j];            
+        #ifdef _DARKGLASS_PABLITO
+        if (mcc->effect_id >= MAX_PLUGIN_INSTANCES && mcc->effect_id < MAX_INSTANCES)
+        {
+            unused = ASSIGNMENT_UNUSED;
+            continue;
+        }
+        #endif
+
+        init_midi_cc(mcc, unused);
+    }
+}
+
+// typedef struct MIDI_CC_T {
+//     int8_t channel;
+//     uint16_t controller;    // if high bit set then controller is an nrpn
+//     float minimum;
+//     float maximum;
+//     int effect_id;
+//     const char* symbol;
+//     port_t* port;
+//     int16_t midiOutValue;
+//     MidiCCType ccType;
+//     uint16_t possible_14_value;
+// } midi_cc_t;
