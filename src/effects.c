@@ -64,6 +64,8 @@ typedef unsigned int uint;
 #include <unistd.h>
 #endif
 
+#define USE_ALTERNATIVE_MIDI_STORAGE 1
+
 /* Jack */
 #include <jack/jack.h>
 #include <jack/intclient.h>
@@ -605,6 +607,10 @@ typedef struct MIDI_CC_T {
     int16_t midiOutValue;
     MidiCCType ccType;
     uint16_t possible_14_value;
+#if USE_ALTERNATIVE_MIDI_STORAGE
+    struct MIDI_CC_T *prev;
+    struct MIDI_CC_T *next;
+#endif        
 } midi_cc_t;
 
 typedef struct ASSIGNMENT_T {
@@ -774,9 +780,31 @@ typedef struct CACHED_EFFECT_FLUSH_T {
 ************************************************************************************************************************
 */
 
+
+
 static tap_tempo_t g_tap_tempo;
 static effect_t g_effects[MAX_INSTANCES];
+#if USE_ALTERNATIVE_MIDI_STORAGE
+#define MAX_MIDI_FEEDBACK_ACTIVE (128)
+static midi_cc_t *g_midi_cc_by_lsb[128], *g_midi_learning = NULL;
+static midi_cc_t *g_midi_feedback_to_send[MAX_MIDI_FEEDBACK_ACTIVE];
+static uint16_t  g_midi_feedback_to_send_count = 0;
+
+#define MIDI_CC_HASH_SIZE 2048
+#define MIDI_CC_HASH_EMPTY 0xFFFF
+
+typedef struct {
+    uint32_t    effect_id;
+    const char  *symbol;
+    midi_cc_t   *mcc;
+} midi_cc_hash_entry_t;
+static midi_cc_hash_entry_t g_midi_cc_hash[MIDI_CC_HASH_SIZE];
+#else
 static midi_cc_t g_midi_cc_list[MAX_MIDI_CC_ASSIGN], *g_midi_learning;
+#endif
+
+#if USE_ALTERNATIVE_MIDI_STORAGE
+#endif
 
 #ifdef HAVE_CONTROLCHAIN
 /* Control Chain */
@@ -1060,20 +1088,40 @@ static bool isMidToggle(midi_cc_t* mcc);
 static bool isMidMomentary(midi_cc_t* mcc);
 
 
-static midi_cc_t *add_midi_cc(int8_t channel, uint16_t controller, 
-                              int effect_id, const char* control_symbol, 
+static void      cancel_midi_learning(void);
+static midi_cc_t *add_midi_cc(int8_t channel, uint16_t controller,
+                              int effect_id, const char* control_symbol,
                               float minimum, float maximum, MidiCCType ccType);
 
-static void      update_midi_cc(midi_cc_t *existing_mcc, int8_t channel, uint16_t controller, 
+static void      update_midi_cc(midi_cc_t *existing_mcc, int8_t channel, uint16_t controller,
                                 float minimum, float maximum, MidiCCType ccType);
 
-static midi_cc_t *get_midi_cc(int8_t channel, uint16_t controller, bool is_cc, uint16_t *start_index);
 static midi_cc_t *get_midi_cc_by_effect_symbol(int effect_id, const char *control_symbol);
-static void      init_midi_cc(midi_cc_t *mcc, int effect_id);
-static void      init_midi_cc_list(void);
 static void      midi_cc_list_remove_effect(int effect_id);
 static void      midi_cc_list_remove_all(void);
 static midi_cc_t *get_midi_cc_needs_sending(uint16_t *start_index);
+static void      init_midi_cc_list(void);
+
+#if USE_ALTERNATIVE_MIDI_STORAGE
+static midi_cc_t    *alloc_midi_cc(int8_t channel, uint16_t controller,
+                                   int effect_id, const char* control_symbol,
+                                   float minimum, float maximum, MidiCCType ccType);
+static void         insert_midi_cc(midi_cc_t *mcc);
+static void         midi_feedback_add(midi_cc_t *mcc);
+static void         clear_midi_cc_needs_sending(void);
+static void         remove_midi_cc(midi_cc_t *mcc);
+static midi_cc_t    *get_midi_cc(int8_t channel, uint16_t controller, midi_cc_t *current);
+static uint32_t     midi_cc_hash_key(int effect_id, const char* symbol);
+static void         midi_cc_hash_init(void);
+static void         midi_cc_hash_insert(int effect_id, const char* symbol, midi_cc_t *mcc);
+static midi_cc_t    *midi_cc_hash_lookup(int effect_id, const char* symbol);
+static void         midi_cc_hash_remove(int effect_id, const char* symbol);
+static void         midi_cc_hash_clear(void);
+#else
+static void      init_midi_cc(midi_cc_t *mcc, int effect_id);
+static midi_cc_t *get_midi_cc(int8_t channel, uint16_t controller, bool is_cc, uint16_t *start_index);
+#endif
+
 
 /*
 ************************************************************************************************************************
@@ -1244,7 +1292,12 @@ static void SetMidiOutValue(midi_cc_t *midiCC)
 {
     int midiValue = GetMidiOutValue(midiCC);
     if(midiValue != -1)
+    {
         midiCC->midiOutValue = midiValue;
+#if USE_ALTERNATIVE_MIDI_STORAGE
+        midi_feedback_add(midiCC);
+#endif
+    }
 }
 
 static void InstanceDelete(int effect_id)
@@ -3159,7 +3212,6 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
     uint16_t controller_14_msb = 0;
     bool possible_14_bit_msb;
     bool possible_14_bit_lsb;
-    bool is_cc;
     uint8_t status_nibble;
     uint16_t mvalue;
     float value;
@@ -3273,6 +3325,9 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
                     mcc = get_midi_cc_needs_sending(&start_index);
             }
         }
+#if USE_ALTERNATIVE_MIDI_STORAGE        
+        clear_midi_cc_needs_sending();
+#endif        
     }
 
     // Handle input MIDI events
@@ -3286,7 +3341,7 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
 
         possible_14_bit_msb = false;
         possible_14_bit_lsb = false;
-        is_cc = false;
+        [[maybe_unused]] bool is_cc = false;
 
         // Handle MIDI Beat Clock
         if (g_transport_sync_mode == TRANSPORT_SYNC_MIDI)
@@ -3597,8 +3652,13 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
         handled = false;
         channel = (event.buffer[0] & 0x0F);
 
+#if USE_ALTERNATIVE_MIDI_STORAGE            
+        midi_cc_t *mcc = get_midi_cc(channel, controller, NULL);
+#else
         uint16_t start_index = 0;
         midi_cc_t *mcc = get_midi_cc(channel, controller, is_cc, &start_index);
+#endif                
+
         while(mcc)
         {
             if (possible_14_bit_msb && mcc->controller == controller_14_msb)
@@ -3675,7 +3735,11 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
             }
             // get next one if using macros
             if(g_enable_midi_macros)
+#if USE_ALTERNATIVE_MIDI_STORAGE            
+                mcc = get_midi_cc(channel, controller, mcc);
+#else
                 mcc = get_midi_cc(channel, controller, is_cc, &start_index);
+#endif                
             else
                 mcc = NULL;
         }
@@ -3700,6 +3764,11 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
                 g_midi_learning->controller = controller;
                 if(midiType == MIDI_TYPE_NOTE)
                     g_midi_learning->ccType = MIDI_CC_MOMENTARY;
+
+#if USE_ALTERNATIVE_MIDI_STORAGE            
+                insert_midi_cc(g_midi_learning);
+#endif
+                // forget midi learning
                 g_midi_learning = NULL;
             }
             else
@@ -6856,7 +6925,7 @@ static void effects_remove_inner_pre(int effect_id)
     if (effect_id == REMOVE_ALL)
     {
         pthread_mutex_lock(&g_midi_learning_mutex);
-        g_midi_learning = NULL;
+        cancel_midi_learning();
         pthread_mutex_unlock(&g_midi_learning_mutex);
 
         midi_cc_list_remove_all();
@@ -6957,12 +7026,7 @@ static void effects_remove_inner_pre(int effect_id)
 
         pthread_mutex_lock(&g_midi_learning_mutex);
         if (g_midi_learning != NULL && g_midi_learning->effect_id == effect_id)
-        {
-            g_midi_learning->effect_id = ASSIGNMENT_UNUSED;
-            g_midi_learning->symbol = NULL;
-            g_midi_learning->port = NULL;
-            g_midi_learning = NULL;
-        }
+            cancel_midi_learning();
         pthread_mutex_unlock(&g_midi_learning_mutex);
 
         midi_cc_list_remove_effect(effect_id);
@@ -8477,12 +8541,7 @@ int effects_midi_learn(int effect_id, const char *control_symbol, float minimum,
     // clear old midi learning
     pthread_mutex_lock(&g_midi_learning_mutex);
     if (g_midi_learning != NULL)
-    {
-        g_midi_learning->effect_id = ASSIGNMENT_UNUSED;
-        g_midi_learning->symbol = NULL;
-        g_midi_learning->port = NULL;
-        g_midi_learning = NULL;
-    }
+        cancel_midi_learning();
     pthread_mutex_unlock(&g_midi_learning_mutex);
 
     // if already mapped set it to re-learn
@@ -8505,7 +8564,11 @@ int effects_midi_learn(int effect_id, const char *control_symbol, float minimum,
     }
 
     // Otherwise add a new mcc
+#if USE_ALTERNATIVE_MIDI_STORAGE
+    midi_cc_t *new_mcc = alloc_midi_cc(-1, 0, effect_id, control_symbol, minimum, maximum, MIDI_CC_VARIABLE);
+#else    
     midi_cc_t *new_mcc = add_midi_cc(-1, 0, effect_id, control_symbol, minimum, maximum, MIDI_CC_VARIABLE);
+#endif
     if(new_mcc)
     {
         pthread_mutex_lock(&g_midi_learning_mutex);
@@ -8575,11 +8638,13 @@ int effects_midi_unmap(int effect_id, const char *control_symbol)
     {
         pthread_mutex_lock(&g_midi_learning_mutex);
         if (g_midi_learning == mcc)
-            g_midi_learning = NULL;
+            cancel_midi_learning();
         pthread_mutex_unlock(&g_midi_learning_mutex);
-
+#if USE_ALTERNATIVE_MIDI_STORAGE
+        remove_midi_cc(mcc);
+#else
         init_midi_cc(mcc, ASSIGNMENT_UNUSED);
-
+#endif
         return SUCCESS;
     }
 
@@ -10485,7 +10550,298 @@ void effects_idle_external_uis(void)
 #endif
 }
 
+void cancel_midi_learning(void)
+{
+ #if USE_ALTERNATIVE_MIDI_STORAGE
+    free(g_midi_learning);
+#else      
+    if(g_midi_learning)
+    {
+        g_midi_learning->effect_id = ASSIGNMENT_UNUSED;
+        g_midi_learning->symbol = NULL;
+        g_midi_learning->port = NULL;
+    }
+#endif            
+    g_midi_learning = NULL;   
+}
 
+#if USE_ALTERNATIVE_MIDI_STORAGE
+void midi_feedback_add(midi_cc_t *mcc)
+{
+    if (g_midi_feedback_to_send_count < MAX_MIDI_FEEDBACK_ACTIVE)
+        g_midi_feedback_to_send[g_midi_feedback_to_send_count++] = mcc;
+    else
+        fprintf(stderr, "Midi feedback overload\n");
+}
+
+midi_cc_t *get_midi_cc_needs_sending(uint16_t *start_index)
+{
+    return g_midi_feedback_to_send[(*start_index)++];
+}
+
+void clear_midi_cc_needs_sending(void)
+{
+    g_midi_feedback_to_send_count = 0;
+}
+
+midi_cc_t *alloc_midi_cc(int8_t channel, uint16_t controller, 
+                       int effect_id, const char* control_symbol, 
+                       float minimum, float maximum, MidiCCType ccType)
+{
+    midi_cc_t *added = malloc(sizeof(midi_cc_t));
+
+    added->channel = channel;
+    added->controller = controller;
+    added->effect_id = effect_id;
+    added->ccType = ccType;
+    added->possible_14_value = 0;
+
+    if (strcmp(control_symbol, g_bypass_port_symbol) == 0)
+    {
+        added->symbol = g_bypass_port_symbol;
+        added->port = NULL;
+    }
+    else
+    {
+        port_t *port = FindEffectInputPortBySymbol(&(g_effects[effect_id]), control_symbol);
+
+        if (port == NULL)
+            return NULL;
+
+        added->minimum = minimum;
+        added->maximum = maximum;
+        added->symbol = port->symbol;
+        added->port = port;
+
+        if (strcmp(control_symbol, g_presets_port_symbol) == 0) 
+        {
+            port->min_value = minimum;
+            port->max_value = maximum;
+        }
+    }
+
+    return added;
+}
+
+void insert_midi_cc(midi_cc_t *mcc)
+{
+    midi_cc_hash_insert(mcc->effect_id, mcc->symbol, mcc);
+
+    // add to front of bucket
+    mcc->prev = NULL;
+    uint8_t idx = mcc->controller & 0x7f;   
+    if(g_midi_cc_by_lsb[idx] == NULL)
+    {
+        mcc->next = NULL;
+        g_midi_cc_by_lsb[idx] = mcc;
+    }
+    else
+    {
+        mcc->next = g_midi_cc_by_lsb[idx];
+        g_midi_cc_by_lsb[idx]->prev = mcc;
+        g_midi_cc_by_lsb[idx] = mcc;
+    }
+}
+
+midi_cc_t *add_midi_cc(int8_t channel, uint16_t controller, 
+                       int effect_id, const char* control_symbol, 
+                       float minimum, float maximum, MidiCCType ccType)
+{
+    midi_cc_t *added = alloc_midi_cc(channel, controller, effect_id, control_symbol, minimum, maximum, ccType);
+    insert_midi_cc(added);
+    return added;
+}
+
+midi_cc_t *get_midi_cc(int8_t channel, uint16_t controller, midi_cc_t *current)
+{
+    midi_cc_t *result = NULL;
+
+    uint8_t idx = controller & 0x7f;   
+    if(!current)
+        result = g_midi_cc_by_lsb[idx];
+    else
+        result = current->next;
+
+    while(result != NULL)
+    {
+        if(result->channel == channel && result->controller == controller)
+        {
+            result = result;
+            break;
+        }
+        result = result->next;
+    }
+
+    return result;
+}
+
+
+midi_cc_t *get_midi_cc_by_effect_symbol(int effect_id, const char *control_symbol)
+{
+    return midi_cc_hash_lookup(effect_id, control_symbol);
+}
+
+void update_midi_cc(midi_cc_t *existing_mcc, int8_t channel, uint16_t controller, 
+                     float minimum, float maximum, MidiCCType ccType)
+{
+    existing_mcc->channel = channel;
+    existing_mcc->controller = controller;
+    existing_mcc->ccType = ccType;
+    existing_mcc->possible_14_value = 0;
+    existing_mcc->minimum = minimum;
+    existing_mcc->maximum = maximum;
+}
+
+void remove_midi_cc(midi_cc_t *mcc)
+{
+    if (mcc == NULL)
+        return;
+
+    if (mcc->prev != NULL)
+        mcc->prev->next = mcc->next;
+    else
+        g_midi_cc_by_lsb[mcc->controller & 0x7f] = mcc->next;
+
+    if (mcc->next != NULL)
+        mcc->next->prev = mcc->prev;
+
+    if (mcc->symbol) 
+        midi_cc_hash_remove(mcc->effect_id, mcc->symbol);
+
+    free(mcc);
+}
+
+void init_midi_cc_list(void)
+{
+    for(int idx = 0; idx < 128; idx++)
+    {
+        midi_cc_t *mcc = g_midi_cc_by_lsb[idx];
+        while(mcc != NULL)
+        {
+            midi_cc_t *next = mcc->next;
+            free(mcc);
+            mcc = next;
+        }
+        g_midi_cc_by_lsb[idx] = NULL;
+    }
+
+    midi_cc_hash_init();
+}
+
+void midi_cc_list_remove_effect(int effect_id)
+{
+    for(int idx = 0; idx < 128; idx++)
+    {
+        midi_cc_t *mcc = g_midi_cc_by_lsb[idx];
+        while(mcc != NULL)
+        {
+            midi_cc_t *next = mcc->next;
+            if(mcc->effect_id == effect_id)
+                remove_midi_cc(mcc);
+
+            mcc = next;
+        }
+    }
+}
+
+void midi_cc_list_remove_all(void)
+{
+    init_midi_cc_list();
+    midi_cc_hash_clear();
+}
+
+
+static inline uint32_t midi_cc_hash_key(int effect_id, const char* symbol)
+{
+    /* FNV-1a hash */
+    uint32_t hash = (uint32_t)effect_id ^ 0x811c9dc5;
+    for (const char* s = symbol; *s; s++) 
+    {
+        hash ^= (uint32_t)(unsigned char)(*s);
+        hash *= 0x01000193;
+    }
+    return hash & (MIDI_CC_HASH_SIZE - 1);
+}
+
+static void midi_cc_hash_init(void)
+{
+    for (int i = 0; i < MIDI_CC_HASH_SIZE; i++) 
+    {
+        g_midi_cc_hash[i].mcc = NULL;
+        g_midi_cc_hash[i].effect_id = 0;
+        g_midi_cc_hash[i].symbol = NULL;
+    }
+}
+
+static void midi_cc_hash_insert(int effect_id, const char* symbol, midi_cc_t *mcc)
+{
+    uint32_t key = midi_cc_hash_key(effect_id, symbol);
+
+    while (g_midi_cc_hash[key].mcc != NULL) 
+        key = (key + 1) & (MIDI_CC_HASH_SIZE - 1);
+
+    g_midi_cc_hash[key].effect_id = effect_id;
+    g_midi_cc_hash[key].symbol = symbol;
+    g_midi_cc_hash[key].mcc = mcc;
+}
+
+static midi_cc_t* midi_cc_hash_lookup(int effect_id, const char* symbol)
+{
+    uint32_t key = midi_cc_hash_key(effect_id, symbol);
+    uint32_t start_key = key;
+
+    while (g_midi_cc_hash[key].mcc != NULL) {
+        if (g_midi_cc_hash[key].effect_id == (uint32_t)effect_id) 
+        {
+            const char* stored_symbol = g_midi_cc_hash[key].symbol;
+            if (stored_symbol && strcmp(stored_symbol, symbol) == 0) 
+            {
+                return g_midi_cc_hash[key].mcc;
+            }
+        }
+        key = (key + 1) & (MIDI_CC_HASH_SIZE - 1);
+        if (key == start_key) {
+            break; // Full!
+        }
+    }
+
+    return NULL;
+}
+
+static void midi_cc_hash_remove(int effect_id, const char* symbol)
+{
+    uint32_t key = midi_cc_hash_key(effect_id, symbol);
+    uint32_t start_key = key;
+
+    while (g_midi_cc_hash[key].mcc != NULL) 
+    {
+        if (g_midi_cc_hash[key].effect_id == (uint32_t)effect_id) 
+        {
+            const char* stored_symbol = g_midi_cc_hash[key].symbol;
+            if (stored_symbol && strcmp(stored_symbol, symbol) == 0) {
+                g_midi_cc_hash[key].mcc = NULL;
+                g_midi_cc_hash[key].effect_id = 0;
+                g_midi_cc_hash[key].symbol = NULL;
+                return;
+            }
+        }
+        key = (key + 1) & (MIDI_CC_HASH_SIZE - 1);
+        if (key == start_key) {
+            break;
+        }
+    }
+}
+
+static void midi_cc_hash_clear(void)
+{
+    for (int i = 0; i < MIDI_CC_HASH_SIZE; i++) {
+        g_midi_cc_hash[i].mcc = NULL;
+        g_midi_cc_hash[i].effect_id = 0;
+        g_midi_cc_hash[i].symbol = NULL;
+    }
+}
+
+#else // USE_ALTERNATIVE_MIDI_STORAGE
 // refactored midi cc functions
 midi_cc_t *add_midi_cc(int8_t channel, uint16_t controller, 
                        int effect_id, const char* control_symbol, 
@@ -10526,7 +10882,6 @@ midi_cc_t *add_midi_cc(int8_t channel, uint16_t controller,
                 port->max_value = maximum;
             }
         }
-
         return mcc;
     }
 
@@ -10617,6 +10972,7 @@ midi_cc_t *get_midi_cc_by_effect_symbol(int effect_id, const char *control_symbo
     return result;
 }
 
+
 void update_midi_cc(midi_cc_t *existing_mcc, int8_t channel, uint16_t controller, 
                      float minimum, float maximum, MidiCCType ccType)
 {
@@ -10671,7 +11027,7 @@ void midi_cc_list_remove_all(void)
 {
     for (int j = MAX_MIDI_CC_ASSIGN, unused = ASSIGNMENT_NULL; --j >= 0;)
     {
-        midi_cc_t *mcc = &g_midi_cc_list[j];            
+        midi_cc_t *mcc = &g_midi_cc_list[j];
         #ifdef _DARKGLASS_PABLITO
         if (mcc->effect_id >= MAX_PLUGIN_INSTANCES && mcc->effect_id < MAX_INSTANCES)
         {
@@ -10680,19 +11036,20 @@ void midi_cc_list_remove_all(void)
         }
         #endif
 
+#if USE_HASH_TABLE
+        /* Remove from hash table before clearing */
+        if (mcc->symbol && mcc->effect_id != ASSIGNMENT_NULL && mcc->effect_id != ASSIGNMENT_UNUSED) {
+            midi_cc_hash_remove(mcc->effect_id, mcc->symbol);
+        }
+#endif // USE_HASH_TABLE
         init_midi_cc(mcc, unused);
     }
+
+#if USE_HASH_TABLE
+    /* Ensure hash table is fully cleared */
+    midi_cc_hash_clear();
+#endif // USE_HASH_TABLE
 }
 
-// typedef struct MIDI_CC_T {
-//     int8_t channel;
-//     uint16_t controller;    // if high bit set then controller is an nrpn
-//     float minimum;
-//     float maximum;
-//     int effect_id;
-//     const char* symbol;
-//     port_t* port;
-//     int16_t midiOutValue;
-//     MidiCCType ccType;
-//     uint16_t possible_14_value;
-// } midi_cc_t;
+#endif // USE_ALTERNATIVE_MIDI_STORAGE
+
