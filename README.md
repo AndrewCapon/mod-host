@@ -229,6 +229,10 @@ The commands supported by mod-host are:
         * monitor audio levels for a specific jack port (on the feedback port)
         e.g.: monitor_audio_levels "system:capture_1" 1
 
+    monitor_cpu_load <enable> <instance_count> <instance_number...>
+        * monitor cpu load for specific instances
+        e.g.: monitor_cpu_load 1 2 0 1
+
     monitor_midi_control <midi_channel> <enable>
         * listen to MIDI control change messages (on the feedback port)
         e.g.: monitor_midi_control 7 1
@@ -264,6 +268,16 @@ The commands supported by mod-host are:
     cv_unmap <instance_number> <param_symbol>
         * unmap the CV source port actuator from a control port
         e.g.: cv_unmap 0 "gain"
+
+    hmi_widget_show <instance_number> <widget_symbol> <area_id> <width> <height> <format>
+        * tell the plugin its HMI widget is now visible on a display area of <width> x <height> pixels, in pixel
+          <format> (ALABS_HMI_PixelFormat: 0 mono 1 bit, 1 gray 4 bits, 2 RGB565, 3 RGB888); what it draws goes to
+          the HMI for <area_id>, which must be unique among the visible widgets
+        e.g.: hmi_widget_show 0 "meter" 1 40 37 0
+
+    hmi_widget_hide <area_id>
+        * tell the plugin its HMI widget is no longer visible, or all of them with -1
+        e.g.: hmi_widget_hide 1
 
     cpu_load
         * return current average jack cpu load

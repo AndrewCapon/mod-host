@@ -96,6 +96,7 @@ typedef enum {
 #define MAX_MIDI_CC_ASSIGN      1024
 #define MAX_POSTPONED_EVENTS    8192
 #define MAX_HMI_ADDRESSINGS     128
+#define MAX_HMI_WIDGETS         16
 
 #define MAX_SYNC_SCHEDULED_PARAMS 512
 
@@ -188,6 +189,8 @@ int effects_cv_unmap(int effect_id, const char *control_symbol);
 int effects_hmi_map(int effect_id, const char *control_symbol, int hw_id, int page, int subpage,
                     int caps, int flags, const char *label, float minimum, float maximum, int steps);
 int effects_hmi_unmap(int effect_id, const char *control_symbol);
+int effects_hmi_widget_show(int effect_id, const char *widget_symbol, int area_id, int width, int height, int format);
+int effects_hmi_widget_hide(int area_id);
 
 float effects_jack_cpu_load(void);
 float effects_jack_max_cpu_load(void);
@@ -200,7 +203,11 @@ int effects_aggregated_midi_enable(int enable);
 int effects_cpu_load_enable(int enable);
 int effects_freewheeling_enable(int enable);
 int effects_processing_enable(int enable);
+int effects_midi_feedback_enable(int enable);
+int effects_midi_feedback_sync_enable(int enable);
+int effects_midi_nrpn_enable(int enable);
 int effects_monitor_audio_levels(const char *source_port_name, int enable);
+int effects_monitor_cpu_load(int enable, int num_effects, int *effects);
 int effects_monitor_midi_control(int channel, int enable);
 int effects_monitor_midi_program(int channel, int enable);
 void effects_transport(int rolling, double beats_per_bar, double beats_per_minute);
@@ -209,6 +216,8 @@ void effect_sync_scheduled_params(int realtime);
 void effects_output_data_ready(void);
 int effects_show_external_ui(int effect_id);
 void effects_idle_external_uis(void);
+void effects_midi_feedback_connect_hw_ports(void);
+void effects_send_midi_feedback(int effect_id, const char *control_symbol);
 
 /*
 ************************************************************************************************************************

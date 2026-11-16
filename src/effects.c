@@ -26,6 +26,7 @@
 #define _GNU_SOURCE
 #endif
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -95,6 +96,7 @@ typedef unsigned int uint;
 #include "lv2/control-port-state-update.h"
 #include "lv2/kxstudio-properties.h"
 #include "lv2/lv2-hmi.h"
+#include "lv2/alabs-hmi-widgets.h"
 #include "lv2/mod-license.h"
 
 // do not enable external-ui support in embed targets
@@ -160,6 +162,10 @@ typedef struct {
 #if defined(_MOD_DEVICE_DUOX) || defined(_MOD_DEVICE_DWARF)
 #define MOD_HMI_CONTROL_ENABLED
 #define MOD_IO_PROCESSING_ENABLED
+#elif defined(MOD_HMI_EMULATOR)
+// a desktop build talking to mod-hw-emulator, which stands in for mod-system-control: the HMI control
+// (labels, leds, plugin widgets through /sys_msgs) without the audio processing of a device
+#define MOD_HMI_CONTROL_ENABLED
 #endif
 
 #ifdef _DARKGLASS_DEVICE_PABLITO
@@ -278,6 +284,7 @@ enum {
     OPTIONS_FEATURE,
 #ifdef MOD_HMI_CONTROL_ENABLED
     HMI_WC_FEATURE,
+    HMI_WD_FEATURE,
 #endif
     LICENSE_FEATURE,
     BUF_SIZE_POWER2_FEATURE,
@@ -300,6 +307,7 @@ enum PostPonedEventType {
     POSTPONED_PARAM_SET,
     POSTPONED_PARAM_STATE,
     POSTPONED_AUDIO_MONITOR,
+    POSTPONED_CPU_MONITOR,
     POSTPONED_OUTPUT_MONITOR,
     POSTPONED_MIDI_CONTROL_CHANGE,
     POSTPONED_MIDI_PROGRAM_CHANGE,
@@ -452,8 +460,9 @@ typedef struct EFFECT_T {
     const MOD_License_Interface *license_iface;
     const LV2_Options_Interface *options_interface;
     const LV2_State_Interface *state_iface;
-#ifdef __MOD_DEVICES__
+#if defined(__MOD_DEVICES__) || defined(MOD_HMI_EMULATOR)
     const LV2_HMI_PluginNotification *hmi_notif;
+    const ALABS_HMI_WidgetNotification *hmi_widget_notif;
 #endif
 
     jack_ringbuffer_t *events_in_buffer;
@@ -461,6 +470,10 @@ typedef struct EFFECT_T {
     char *events_in_buffer_helper;
 
     bool activated;
+
+    atomic_bool monitor_cpu;
+    atomic_bool monitor_cpu_reset;
+    double cpu_load;
 
     // previous transport state
     bool transport_rolling;
@@ -507,6 +520,7 @@ typedef struct LILV_NODES_T {
     LilvNode *event;
     LilvNode *freeWheeling;
     LilvNode *hmi_interface;
+    LilvNode *hmi_widget_interface;
     LilvNode *input;
     LilvNode *integer;
     LilvNode *is_live;
@@ -615,6 +629,16 @@ typedef struct HMI_ADDRESSING_T {
     uint8_t page;
     uint8_t subpage;
 } hmi_addressing_t;
+
+// A plugin widget visible on the HMI, between hmi_widget_show and hmi_widget_hide.
+// The slots are never freed, only marked unused with area_id -1, so a plugin calling draw_bitmap with a
+// handle that was just hidden finds an unused slot and draws nothing.
+typedef struct HMI_WIDGET_T {
+    int area_id;
+    int effect_id;
+    uint16_t width, height;
+    ALABS_HMI_PixelFormat format;
+} hmi_widget_t;
 #endif
 
 typedef struct SYNC_SCHEDULED_PARAM_T {
@@ -639,9 +663,14 @@ typedef struct POSTPONED_AUDIO_MONITOR_EVENT_T {
     float value;
 } postponed_audio_monitor_event_t;
 
+typedef struct POSTPONED_CPU_MONITOR_EVENT_T {
+    int effect_id;
+    float cpu_load;
+} postponed_cpu_monitor_event_t;
+
 typedef struct POSTPONED_MIDI_CONTROL_CHANGE_EVENT_T {
     int8_t channel;
-    int8_t control;
+    uint16_t controller;    // if high bit set then controller is an nrpn
     int16_t value;
 } postponed_midi_control_change_event_t;
 
@@ -654,7 +683,7 @@ typedef struct POSTPONED_MIDI_MAP_EVENT_T {
     int effect_id;
     const char* symbol;
     int8_t channel;
-    uint8_t controller;
+    uint16_t controller;    // if high bit set then controller is an nrpn
     float value;
     float minimum;
     float maximum;
@@ -689,6 +718,7 @@ typedef struct POSTPONED_EVENT_T {
         postponed_parameter_event_t parameter;
         postponed_parameter_state_t state;
         postponed_audio_monitor_event_t audio_monitor;
+        postponed_cpu_monitor_event_t cpu_monitor;
         postponed_midi_control_change_event_t control_change;
         postponed_midi_program_change_event_t program_change;
         postponed_midi_map_event_t midi_map;
@@ -786,6 +816,7 @@ static jack_nframes_t g_sample_rate, g_max_allowed_midi_delta;
 static float g_sample_rate_f;
 static const char **g_capture_ports, **g_playback_ports;
 static int32_t g_midi_buffer_size, g_block_length;
+static double g_block_time_us;
 static int32_t g_thread_policy, g_thread_priority;
 #ifdef MOD_IO_PROCESSING_ENABLED
 static jack_port_t *g_audio_in1_port;
@@ -796,6 +827,7 @@ static jack_port_t *g_audio_out2_port;
 static audio_monitor_t *g_audio_monitors;
 static pthread_mutex_t g_audio_monitor_mutex;
 static int g_audio_monitor_count;
+static int g_audio_monitor_port_id = 0; // this contains the next index to be used for a new audio monitor port name, it is never decremented when a port is removed
 static jack_port_t *g_midi_in_port;
 static jack_port_t *g_midi_out_port;
 static jack_position_t g_jack_pos;
@@ -834,6 +866,7 @@ static lilv_nodes_t g_lilv_nodes;
 static urids_t g_urids;
 #ifdef MOD_HMI_CONTROL_ENABLED
 static LV2_HMI_WidgetControl g_hmi_wc;
+static ALABS_HMI_WidgetDraw g_hmi_wd;
 #endif
 static MOD_License_Feature g_license;
 static LV2_Atom_Forge g_lv2_atom_forge;
@@ -864,6 +897,7 @@ static LV2_Feature g_buf_size_features[3] = {
 };
 #ifdef MOD_HMI_CONTROL_ENABLED
 static LV2_Feature g_hmi_wc_feature = { LV2_HMI__WidgetControl, &g_hmi_wc };
+static LV2_Feature g_hmi_wd_feature = { ALABS_HMI__WidgetDraw, &g_hmi_wd };
 #endif
 static LV2_Feature g_license_feature = { MOD_LICENSE__feature, &g_license };
 static LV2_Feature g_lv2_log_feature = { LV2_LOG__log, &g_lv2_log };
@@ -897,6 +931,8 @@ static sys_serial_shm_data* g_hmi_data;
 static ZixThread g_hmi_client_thread;
 static pthread_mutex_t g_hmi_mutex;
 static hmi_addressing_t g_hmi_addressings[MAX_HMI_ADDRESSINGS];
+static hmi_widget_t g_hmi_widgets[MAX_HMI_WIDGETS];
+static int g_hmi_widgets_next;
 #endif
 
 /* internal processing */
@@ -982,6 +1018,13 @@ static void HMIWidgetsPopupMessage(LV2_HMI_WidgetControl_Handle handle,
                                    LV2_HMI_Popup_Style style,
                                    const char* title,
                                    const char* text);
+static void HMIWidgetsDrawBitmap(ALABS_HMI_WidgetDraw_Handle handle,
+                                 ALABS_HMI_Widget widget,
+                                 uint16_t x,
+                                 uint16_t y,
+                                 uint16_t width,
+                                 uint16_t height,
+                                 const uint8_t* bits);
 #endif
 static char *GetLicenseFile(MOD_License_Handle handle, const char *license_uri);
 static int LogPrintf(LV2_Log_Handle handle, LV2_URID type, const char *fmt, ...);
@@ -1170,6 +1213,7 @@ static void AllocatePortBuffers(effect_t* effect, int in_size, int out_size)
 static int BufferSize(jack_nframes_t nframes, void* data)
 {
     g_block_length = nframes;
+    g_block_time_us = (double)(nframes * 1e6) / g_sample_rate;
     g_midi_buffer_size = jack_port_type_get_buffer_size(g_jack_global_client, JACK_DEFAULT_MIDI_TYPE);
 
     if (data)
@@ -1432,10 +1476,11 @@ static void RunPostPonedEvents(int ignored_effect_id)
     // cached data, to make sure we only handle similar events once
     bool got_midi_program = false;
     bool got_transport = false;
-    postponed_cached_effect_events cached_audio_monitor, cached_process_out_buf;
+    postponed_cached_effect_events cached_audio_monitor, cached_cpu_monitor, cached_process_out_buf;
     postponed_cached_symbol_events cached_param_set, cached_param_state, cached_output_mon;
 
     cached_audio_monitor.last_effect_id = -1;
+    cached_cpu_monitor.last_effect_id = -1;
     cached_process_out_buf.last_effect_id = -1;
     cached_param_set.last_effect_id = -1;
     cached_param_set.last_symbol[0] = '\0';
@@ -1447,6 +1492,7 @@ static void RunPostPonedEvents(int ignored_effect_id)
     cached_output_mon.last_symbol[0] = '\0';
     cached_output_mon.last_symbol[MAX_CHAR_BUF_SIZE] = '\0';
     INIT_LIST_HEAD(&cached_audio_monitor.effects.siblings);
+    INIT_LIST_HEAD(&cached_cpu_monitor.effects.siblings);
     INIT_LIST_HEAD(&cached_process_out_buf.effects.siblings);
     INIT_LIST_HEAD(&cached_param_set.symbols.siblings);
     INIT_LIST_HEAD(&cached_param_state.symbols.siblings);
@@ -1533,6 +1579,20 @@ static void RunPostPonedEvents(int ignored_effect_id)
             cached_audio_monitor.last_effect_id = eventptr->event.audio_monitor.index;
             break;
 
+        case POSTPONED_CPU_MONITOR:
+            if (eventptr->event.cpu_monitor.effect_id == ignored_effect_id)
+                continue;
+            if (ShouldIgnorePostPonedEffectEvent(eventptr->event.cpu_monitor.effect_id, &cached_cpu_monitor))
+                continue;
+
+            snprintf(buf, FEEDBACK_BUF_SIZE, "cpu_monitor %i %f", eventptr->event.cpu_monitor.effect_id,
+                                                                  eventptr->event.cpu_monitor.cpu_load);
+            socket_send_feedback_debug(buf);
+
+            // save for fast checkup next time
+            cached_cpu_monitor.last_effect_id = eventptr->event.cpu_monitor.effect_id;
+            break;
+
         case POSTPONED_OUTPUT_MONITOR:
             if (eventptr->event.parameter.effect_id == ignored_effect_id)
                 continue;
@@ -1567,7 +1627,7 @@ static void RunPostPonedEvents(int ignored_effect_id)
         case POSTPONED_MIDI_CONTROL_CHANGE:
             snprintf(buf, FEEDBACK_BUF_SIZE, "midi_control_change %i %i %i",
                      eventptr->event.control_change.channel,
-                     eventptr->event.control_change.control,
+                     eventptr->event.control_change.controller,
                      eventptr->event.control_change.value);
             socket_send_feedback_debug(buf);
             break;
@@ -1844,6 +1904,11 @@ static void RunPostPonedEvents(int ignored_effect_id)
         peffect = list_entry(it, postponed_cached_effect_list_data, siblings);
         free(peffect);
     }
+    list_for_each_safe(it, it2, &cached_cpu_monitor.effects.siblings)
+    {
+        peffect = list_entry(it, postponed_cached_effect_list_data, siblings);
+        free(peffect);
+    }
     list_for_each_safe(it, it2, &cached_process_out_buf.effects.siblings)
     {
         peffect = list_entry(it, postponed_cached_effect_list_data, siblings);
@@ -2050,10 +2115,15 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
     }
 
     /* common variables */
+    const bool monitor_cpu = atomic_load(&effect->monitor_cpu);
     bool needs_post = false;
     const float *buffer_in;
     float *buffer_out;
     float value;
+    uint64_t time_start;
+
+    if (monitor_cpu)
+        time_start = time_ns_get();
 
     /* transport */
     uint8_t stack_buf[MAX_CHAR_BUF_SIZE+1];
@@ -2594,6 +2664,38 @@ static int ProcessPlugin(jack_nframes_t nframes, void *arg)
 
     if (effect->hints & HINT_STATE_UNSAFE)
         pthread_mutex_unlock(&effect->state_restore_mutex);
+
+    if (monitor_cpu)
+    {
+        if (atomic_exchange(&effect->monitor_cpu_reset, false))
+            effect->cpu_load = 0.f;
+
+        const double cpu_load = (double)(time_ns_get() - time_start) / g_block_time_us;
+
+        if (cpu_load > effect->cpu_load)
+        {
+            postponed_event_list_data* const posteventptr = rtsafe_memory_pool_allocate_atomic(g_rtsafe_mem_pool);
+
+            if (posteventptr != NULL)
+            {
+                // Only raise the record once we know we can report it. Raising it first
+                // loses the reading whenever the pool is momentarily empty, and because
+                // the record has already moved, nothing lower will ever report again --
+                // the plugin goes quiet for good.
+                effect->cpu_load = cpu_load;
+
+                posteventptr->event.type = POSTPONED_CPU_MONITOR;
+                posteventptr->event.cpu_monitor.effect_id = effect->instance;
+                posteventptr->event.cpu_monitor.cpu_load  = cpu_load * 0.001;
+
+                pthread_mutex_lock(&g_rtsafe_mutex);
+                list_add_tail(&posteventptr->siblings, &g_rtsafe_list);
+                pthread_mutex_unlock(&g_rtsafe_mutex);
+
+                needs_post = true;
+            }
+        }
+    }
 
     if (needs_post)
         sem_post(&g_postevents_semaphore);
@@ -3267,7 +3369,7 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
                 {
                     posteventptr->event.type = POSTPONED_MIDI_CONTROL_CHANGE;
                     posteventptr->event.control_change.channel = channel;
-                    posteventptr->event.control_change.control = controller;
+                    posteventptr->event.control_change.controller = controller;
                     posteventptr->event.control_change.value = mvalue;
 
                     pthread_mutex_lock(&g_rtsafe_mutex);
@@ -3585,6 +3687,7 @@ static void GetFeatures(effect_t *effect)
     features[OPTIONS_FEATURE]           = &g_options_feature;
 #ifdef MOD_HMI_CONTROL_ENABLED
     features[HMI_WC_FEATURE]            = &g_hmi_wc_feature;
+    features[HMI_WD_FEATURE]            = &g_hmi_wd_feature;
 #endif
     features[LICENSE_FEATURE]           = &g_license_feature;
     features[BUF_SIZE_POWER2_FEATURE]   = &g_buf_size_features[0];
@@ -3798,8 +3901,10 @@ static void ConnectToAllHardwareMIDIPorts(void)
         const char *ourportname = jack_port_name(g_midi_in_port);
 
         for (int i=0; midihwports[i] != NULL; ++i)
+        {
+            printf("%s\n", midihwports[i]);
             jack_connect(g_jack_global_client, midihwports[i], ourportname);
-
+        }
         struct list_head *it;
         pthread_mutex_lock(&g_raw_midi_port_mutex);
         list_for_each(it, &g_raw_midi_port_list)
@@ -3816,41 +3921,7 @@ static void ConnectToAllHardwareMIDIPorts(void)
         jack_free(midihwports);
     }
 
-    if(g_enable_midi_feedback)
-    {
-        const char** const midihwports = jack_get_ports(g_jack_global_client, "",
-                                                        JACK_DEFAULT_MIDI_TYPE,
-                                                        JackPortIsTerminal|JackPortIsPhysical|JackPortIsInput);
-        if (midihwports != NULL)
-        {
-            const char *ourportname = jack_port_name(g_midi_out_port);
-
-            char  aliases[2][320];
-            char* aliasesptr[2] = {
-                aliases[0],
-                aliases[1]
-            };
-
-            for (int i=0; midihwports[i] != NULL; ++i)
-            {
-                jack_port_t* const port = jack_port_by_name(g_jack_global_client, midihwports[i]);
-
-                if (port == NULL)
-                    continue;
-
-                if (jack_port_get_aliases(port, aliasesptr) > 0)
-                {
-                    if (strncmp(aliases[0], "alsa_pcm:Midi-Through/", 22) == 0)
-                        continue;
-                }
-
-                jack_connect(g_jack_global_client, ourportname, midihwports[i]);
-            }
-
-            jack_free(midihwports);
-        }
-    }
-}
+ }
 
 static void ConnectToMIDIThroughPorts(void)
 {
@@ -4115,6 +4186,88 @@ static void HMIWidgetsPopupMessage(LV2_HMI_WidgetControl_Handle handle,
 
     pthread_mutex_lock(&g_hmi_mutex);
     sys_serial_write(&g_hmi_data->server, sys_serial_event_type_popup, page, subpage, msg);
+    pthread_mutex_unlock(&g_hmi_mutex);
+}
+
+static void HMIWidgetsDrawBitmap(ALABS_HMI_WidgetDraw_Handle handle,
+                                 ALABS_HMI_Widget widget_ptr,
+                                 uint16_t x,
+                                 uint16_t y,
+                                 uint16_t width,
+                                 uint16_t height,
+                                 const uint8_t* bits)
+{
+    if (handle == NULL || widget_ptr == NULL || g_hmi_data == NULL) {
+        return;
+    }
+
+    const hmi_widget_t *widget = (const hmi_widget_t*)widget_ptr;
+
+    const int area_id = widget->area_id;
+
+    // hidden, the plugin should have stopped drawing
+    if (area_id == -1)
+        return;
+
+    if (width == 0 || height == 0 || x >= widget->width || y >= widget->height)
+        return;
+
+    // clip to the area here, it saves the bytes to the HMI. Rows start at x whatever it is,
+    // so clipping on the right is only a matter of sending fewer bytes of each row.
+    const uint16_t clip_width = width < widget->width - x ? width : widget->width - x;
+    const uint16_t clip_height = height < widget->height - y ? height : widget->height - y;
+
+    // how many bytes a row of so many pixels takes in the format of the area
+    #define ROW_BYTES(w) (widget->format == ALABS_HMI_PixelFormat_Gray4  ? ((size_t)(w) + 1) / 2 : \
+                          widget->format == ALABS_HMI_PixelFormat_RGB565 ? (size_t)(w) * 2 :       \
+                          widget->format == ALABS_HMI_PixelFormat_RGB888 ? (size_t)(w) * 3 :       \
+                                                                         ((size_t)(w) + 7) / 8)
+
+    if (g_verbose_debug) {
+        printf("DEBUG: HMIWidgetsDrawBitmap %i: %u %u %u %u %s\n",
+               area_id, x, y, clip_width, clip_height, bits != NULL ? "bitmap" : "clear");
+        fflush(stdout);
+    }
+
+    // the whole 128x64 mono display in hex, plus the header; larger bitmaps are refused below
+    char msg[2 * 1024 + 64];
+    int len = snprintf(msg, sizeof(msg), "%i %u %u %u %u", area_id, x, y, clip_width, clip_height);
+
+    if (bits != NULL)
+    {
+        const size_t src_stride = ROW_BYTES(width);
+        const size_t dst_stride = ROW_BYTES(clip_width);
+
+        if (len + 1 + dst_stride * 2 * clip_height >= sizeof(msg))
+        {
+            fprintf(stderr, "HMIWidgetsDrawBitmap: bitmap too large\n");
+            return;
+        }
+
+        static const char hexdigits[] = "0123456789abcdef";
+
+        msg[len++] = ' ';
+
+        for (uint16_t row = 0; row < clip_height; ++row)
+        {
+            const uint8_t *src = bits + src_stride * row;
+
+            for (size_t i = 0; i < dst_stride; ++i)
+            {
+                msg[len++] = hexdigits[src[i] >> 4];
+                msg[len++] = hexdigits[src[i] & 0xf];
+            }
+        }
+
+        msg[len] = '\0';
+    }
+
+    #undef ROW_BYTES
+
+    pthread_mutex_lock(&g_hmi_mutex);
+    sys_serial_write(&g_hmi_data->server,
+                     bits != NULL ? sys_serial_event_type_widget_bitmap : sys_serial_event_type_widget_clear,
+                     0, 0, msg);
     pthread_mutex_unlock(&g_hmi_mutex);
 }
 
@@ -4592,6 +4745,8 @@ int effects_init(void* client)
         return ERR_JACK_CLIENT_CREATION;
     }
 
+    time_ns_init();
+
     /* Register jack ports */
     g_midi_in_port = jack_port_register(g_jack_global_client, "midi_in", JACK_DEFAULT_MIDI_TYPE, JackPortIsInput, 0);
 
@@ -4603,35 +4758,17 @@ int effects_init(void* client)
         return ERR_JACK_PORT_REGISTER;
     }
 	
-    // check midi feedback mode 
-    // ENABLE_MIDI_FEEDBACK==0 Turn midi feedback off
-    // ENABLE_MIDI_FEEDBACK==1 Turn midi feedback on with no sync for multiple devices
-    // ENABLE_MIDI_FEEDBACK==2 Turn midi feedback on with sync for multiple devices
-    const char* const enable_midi_feedback = getenv("ENABLE_MIDI_FEEDBACK");
-    g_enable_midi_feedback      = enable_midi_feedback == NULL || atoi(enable_midi_feedback) != 0; 
-    g_enable_midi_feedback_sync = enable_midi_feedback == NULL || atoi(enable_midi_feedback) == 2;
+    // midi feedback and NRPNs disabled on start
+    // use "feature_enable" to enable them
+    g_enable_midi_feedback = false;
+    g_enable_midi_feedback_sync = false;
+    g_enable_nrpn = false;
 
-    // setup nrpn mode
-    // ENABLE_MIDI_FEEDBACK==0 Turn NRPN off
-    // ENABLE_MIDI_FEEDBACK==1 Turn NRPN on
-    const char* const enable_nrpn = getenv("ENABLE_MIDI_NRPN");
-    g_enable_nrpn = enable_nrpn == NULL || atoi(enable_nrpn) != 0;
+    
+    // setup nrpn 
     g_nrpn_param_num   = 0xC000; // top two bits signify that msb and lsb need setting
     g_nrpn_param_value = 0xC000; // top two bits signify that msb and lsb need setting
 
-    // if midi feedback is enable create output midi port
-    if(g_enable_midi_feedback)
-    {
-        g_midi_out_port = jack_port_register(g_jack_global_client, "midi_out", JACK_DEFAULT_MIDI_TYPE, JackPortIsOutput, 0);
-
-        if (! g_midi_out_port)
-        {
-            fprintf(stderr, "can't register global jack midi-out port\n");
-            if (client == NULL)
-                jack_client_close(g_jack_global_client);
-            return ERR_JACK_PORT_REGISTER;
-        }
-    }
 #ifdef MOD_IO_PROCESSING_ENABLED
     g_audio_in1_port = jack_port_register(g_jack_global_client, "in1", JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput, 0);
     g_audio_in2_port = jack_port_register(g_jack_global_client, "in2", JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput, 0);
@@ -4692,6 +4829,7 @@ int effects_init(void* client)
     /* Get buffers size */
     g_block_length = jack_get_buffer_size(g_jack_global_client);
     g_sample_rate = jack_get_sample_rate(g_jack_global_client);
+    g_block_time_us = (double)(g_block_length * 1e6) / g_sample_rate;
     g_sample_rate_f = g_sample_rate;
     g_midi_buffer_size = jack_port_type_get_buffer_size(g_jack_global_client, JACK_DEFAULT_MIDI_TYPE);
     g_max_allowed_midi_delta = (jack_nframes_t)(g_sample_rate * 0.2); // max 200ms of allowed delta
@@ -4864,6 +5002,7 @@ int effects_init(void* client)
     g_lilv_nodes.event = lilv_new_uri(g_lv2_data, LILV_URI_EVENT_PORT);
     g_lilv_nodes.freeWheeling = lilv_new_uri(g_lv2_data, LV2_CORE__freeWheeling);
     g_lilv_nodes.hmi_interface = lilv_new_uri(g_lv2_data, LV2_HMI__PluginNotification);
+    g_lilv_nodes.hmi_widget_interface = lilv_new_uri(g_lv2_data, ALABS_HMI__WidgetNotification);
     g_lilv_nodes.input = lilv_new_uri(g_lv2_data, LILV_URI_INPUT_PORT);
     g_lilv_nodes.integer = lilv_new_uri(g_lv2_data, LV2_CORE__integer);
     g_lilv_nodes.license_interface = lilv_new_uri(g_lv2_data, MOD_LICENSE__interface);
@@ -5044,24 +5183,32 @@ int effects_init(void* client)
     g_hmi_wc.set_indicator           = HMIWidgetsSetIndicator;
     g_hmi_wc.popup_message           = HMIWidgetsPopupMessage;
 
+    g_hmi_wd.size                    = sizeof(g_hmi_wd);
+    g_hmi_wd.draw_bitmap             = HMIWidgetsDrawBitmap;
+
     if (client != NULL)
     {
         // HMI integration setup
         if (sys_serial_open(&g_hmi_shmfd, &g_hmi_data))
         {
             g_hmi_wc.handle = g_hmi_data;
+            g_hmi_wd.handle = g_hmi_data;
             sys_serial_write(&g_hmi_data->server, sys_serial_event_type_special_req, 0, 0, "restart");
             zix_thread_create(&g_hmi_client_thread, 0, HMIClientThread, &g_hmi_data->client);
         }
         else
         {
             g_hmi_wc.handle = NULL;
+            g_hmi_wd.handle = NULL;
             fprintf(stderr, "sys_host HMI setup failed\n");
         }
     }
 
     for (int i = 0; i < MAX_HMI_ADDRESSINGS; i++)
         g_hmi_addressings[i].actuator_id = -1;
+
+    for (int i = 0; i < MAX_HMI_WIDGETS; i++)
+        g_hmi_widgets[i].area_id = -1;
 #endif
 
 #ifdef MOD_IO_PROCESSING_ENABLED
@@ -5139,11 +5286,6 @@ int effects_init(void* client)
         const char *ourportnamein = jack_port_name(g_midi_in_port);
         jack_connect(g_jack_global_client, "mod-midi-merger:out", ourportnamein);
 
-        if(g_enable_midi_feedback)
-        {
-            const char *ourportnameout = jack_port_name(g_midi_out_port);
-            jack_connect(g_jack_global_client, ourportnameout, "mod-midi-broadcaster:in");
-        }
         ConnectToMIDIThroughPorts();
     }
     /* Else connect to all good hw ports (system, ttymidi and nooice) */
@@ -5151,6 +5293,18 @@ int effects_init(void* client)
     {
         ConnectToAllHardwareMIDIPorts();
     }
+
+    // enable midi feedback, sync and nrpn
+    if(access("/data/midi-feedback", F_OK) != -1) 
+        effects_midi_feedback_enable(true);
+
+    if(access("/data/midi-feedback-sync", F_OK) != -1) 
+        effects_midi_feedback_sync_enable(true);
+    
+    if(access("/data/midi-nrpn", F_OK) != -1) 
+        effects_midi_nrpn_enable(true);
+    
+
 
 #ifdef MOD_IO_PROCESSING_ENABLED
     /* Connect to capture ports if avaiable */
@@ -5231,6 +5385,7 @@ int effects_finish(int close_client)
     lilv_node_free(g_lilv_nodes.event);
     lilv_node_free(g_lilv_nodes.freeWheeling);
     lilv_node_free(g_lilv_nodes.hmi_interface);
+    lilv_node_free(g_lilv_nodes.hmi_widget_interface);
     lilv_node_free(g_lilv_nodes.input);
     lilv_node_free(g_lilv_nodes.integer);
     lilv_node_free(g_lilv_nodes.license_interface);
@@ -5340,6 +5495,9 @@ int effects_add(const char *uri, int instance, int activate)
     mod_memset(effect, 0, sizeof(effect_t));
     effect->instance = instance;
     effect->activated = activate;
+
+    atomic_init(&effect->monitor_cpu, false);
+    atomic_init(&effect->monitor_cpu_reset, true);
 
     /* Init the pointers */
     plugin_uri = NULL;
@@ -5480,12 +5638,22 @@ int effects_add(const char *uri, int instance, int activate)
         }
     }
 
-#ifdef __MOD_DEVICES__
+#if defined(__MOD_DEVICES__) || defined(MOD_HMI_EMULATOR)
     if (lilv_plugin_has_extension_data(effect->lilv_plugin, g_lilv_nodes.hmi_interface))
     {
         effect->hmi_notif =
             (const LV2_HMI_PluginNotification*) lilv_instance_get_extension_data(effect->lilv_instance,
                                                                                  LV2_HMI__PluginNotification);
+    }
+
+    if (lilv_plugin_has_extension_data(effect->lilv_plugin, g_lilv_nodes.hmi_widget_interface))
+    {
+        const ALABS_HMI_WidgetNotification *widget_notif =
+            (const ALABS_HMI_WidgetNotification*) lilv_instance_get_extension_data(effect->lilv_instance,
+                                                                                 ALABS_HMI__WidgetNotification);
+
+        if (widget_notif != NULL && widget_notif->size >= ALABS_HMI_WIDGETNOTIFICATION_SIZE_BASE)
+            effect->hmi_widget_notif = widget_notif;
     }
 #endif
 
@@ -6183,7 +6351,7 @@ int effects_add(const char *uri, int instance, int activate)
     effect->presets_port.buffer_count = 1;
     effect->presets_port.buffer = &effect->preset_value;
     effect->presets_port.min_value = 0.0f;
-    effect->presets_port.max_value = 1.0f;
+    effect->presets_port.max_value = 126.0f;
     effect->presets_port.def_value = 0.0f;
     effect->presets_port.prev_value = 0.0f;
     effect->presets_port.type = TYPE_CONTROL;
@@ -6398,11 +6566,13 @@ static void effects_remove_inner_pre(int effect_id)
 
         for (int j = MAX_MIDI_CC_ASSIGN, unused = ASSIGNMENT_NULL; --j >= 0;)
         {
+            #ifdef _DARKGLASS_PABLITO
             if (g_midi_cc_list[j].effect_id >= MAX_PLUGIN_INSTANCES && g_midi_cc_list[j].effect_id < MAX_INSTANCES)
             {
                 unused = ASSIGNMENT_UNUSED;
                 continue;
             }
+            #endif
             g_midi_cc_list[j].channel = -1;
             g_midi_cc_list[j].controller = 0;
             g_midi_cc_list[j].minimum = 0.0f;
@@ -6410,6 +6580,7 @@ static void effects_remove_inner_pre(int effect_id)
             g_midi_cc_list[j].effect_id = unused;
             g_midi_cc_list[j].symbol = NULL;
             g_midi_cc_list[j].port = NULL;
+            g_midi_cc_list[j].midiOutValue = -1;
         }
 
 #ifdef HAVE_CONTROLCHAIN
@@ -6450,6 +6621,9 @@ static void effects_remove_inner_pre(int effect_id)
 #ifdef MOD_HMI_CONTROL_ENABLED
         for (int i = 0; i < MAX_HMI_ADDRESSINGS; i++)
             g_hmi_addressings[i].actuator_id = -1;
+
+        for (int i = 0; i < MAX_HMI_WIDGETS; i++)
+            g_hmi_widgets[i].area_id = -1;
 
         if (g_hmi_data != NULL)
         {
@@ -6570,6 +6744,15 @@ static void effects_remove_inner_pre(int effect_id)
 static void effects_remove_inner_loop(int effect_id)
 {
     effect_t *effect = &g_effects[effect_id];
+
+#ifdef MOD_HMI_CONTROL_ENABLED
+    // the plugin is going away, there is nobody left to tell
+    for (int i = 0; i < MAX_HMI_WIDGETS; i++)
+    {
+        if (g_hmi_widgets[i].area_id != -1 && g_hmi_widgets[i].effect_id == effect_id)
+            g_hmi_widgets[i].area_id = -1;
+    }
+#endif
 
 #ifdef WITH_EXTERNAL_UI_SUPPORT
     if (effect->ui_libhandle != NULL)
@@ -8140,6 +8323,7 @@ int effects_midi_map(int effect_id, const char *control_symbol, int channel, int
     }
 
     const bool is_bypass = !strcmp(control_symbol, g_bypass_port_symbol);
+    const bool is_preset = !strcmp(control_symbol, g_presets_port_symbol);
 
     // update current mapping first if it exists
     for (int i = 0; i < MAX_MIDI_CC_ASSIGN; i++)
@@ -8175,6 +8359,10 @@ int effects_midi_map(int effect_id, const char *control_symbol, int channel, int
         if (INSTANCE_IS_VALID(g_midi_cc_list[i].effect_id))
             continue;
 
+        g_midi_cc_list[i].channel = channel;
+        g_midi_cc_list[i].controller = controller;
+        g_midi_cc_list[i].effect_id = effect_id;
+
         if (is_bypass)
         {
             g_midi_cc_list[i].symbol = g_bypass_port_symbol;
@@ -8192,14 +8380,16 @@ int effects_midi_map(int effect_id, const char *control_symbol, int channel, int
             g_midi_cc_list[i].symbol = port->symbol;
             g_midi_cc_list[i].port = port;
 
+            if(is_preset) {
+                port->min_value = minimum;
+                port->max_value = maximum;
+            }
+
             // if midi feedback is enabled set this cc to be sent
             if(g_enable_midi_feedback)
                 SetMidiOutValue(&(g_midi_cc_list[i]));
         }
 
-        g_midi_cc_list[i].channel = channel;
-        g_midi_cc_list[i].controller = controller;
-        g_midi_cc_list[i].effect_id = effect_id;
         return SUCCESS;
     }
 
@@ -8711,8 +8901,17 @@ int effects_cv_map(int effect_id, const char *control_symbol, const char *source
             char *value_max = NULL;
 
             // get values from jack metadata
+#ifdef __MOD_DEVICES__ 
             if (jack_get_property(uuid, LV2_CORE__minimum, &value_min, NULL) == 0 &&
                 jack_get_property(uuid, LV2_CORE__maximum, &value_max, NULL) == 0)
+#else        
+            // passing NULL for type is seg faulting here on ubuntu so pass type vars in
+            char *type_min = NULL;
+            char *type_max = NULL;
+
+            if (jack_get_property(uuid, LV2_CORE__minimum, &value_min, &type_min) == 0 &&
+                jack_get_property(uuid, LV2_CORE__maximum, &value_max, &type_max) == 0)
+#endif
             {
                 source_has_ranges = true;
                 source_min_value = atof(value_min);
@@ -9033,6 +9232,106 @@ int effects_hmi_unmap(int effect_id, const char *control_symbol)
 #endif
 }
 
+int effects_hmi_widget_show(int effect_id, const char *widget_symbol, int area_id, int width, int height, int format)
+{
+#ifdef MOD_HMI_CONTROL_ENABLED
+    if (!InstanceExist(effect_id))
+        return ERR_INSTANCE_NON_EXISTS;
+    if (area_id < 0 || width <= 0 || width > 0xffff || height <= 0 || height > 0xffff)
+        return ERR_ASSIGNMENT_INVALID_OP;
+    if (format < ALABS_HMI_PixelFormat_Mono1 || format > ALABS_HMI_PixelFormat_RGB888)
+        return ERR_ASSIGNMENT_INVALID_OP;
+
+    effect_t *effect = &(g_effects[effect_id]);
+
+    if (effect->hmi_widget_notif == NULL)
+        return ERR_ASSIGNMENT_UNUSED;
+
+    for (int i = 0; i < MAX_HMI_WIDGETS; i++)
+    {
+        if (g_hmi_widgets[i].area_id == area_id)
+            return ERR_ASSIGNMENT_ALREADY_EXISTS;
+    }
+
+    // find an unused slot, starting after the last one taken so a handle just hidden is not reused at once
+    hmi_widget_t *widget = NULL;
+
+    for (int i = 0; i < MAX_HMI_WIDGETS; i++)
+    {
+        const int index = (g_hmi_widgets_next + i) % MAX_HMI_WIDGETS;
+
+        if (g_hmi_widgets[index].area_id == -1)
+        {
+            widget = &g_hmi_widgets[index];
+            g_hmi_widgets_next = (index + 1) % MAX_HMI_WIDGETS;
+            break;
+        }
+    }
+
+    if (widget == NULL)
+        return ERR_ASSIGNMENT_LIST_FULL;
+
+    widget->effect_id = effect_id;
+    widget->width = width;
+    widget->height = height;
+    widget->format = (ALABS_HMI_PixelFormat)format;
+    widget->area_id = area_id;
+
+    const ALABS_HMI_WidgetArea area = {
+        .size = sizeof(ALABS_HMI_WidgetArea),
+        .width = width,
+        .height = height,
+        .pixelFormat = (ALABS_HMI_PixelFormat)format,
+    };
+    effect->hmi_widget_notif->widget_shown(lilv_instance_get_handle(effect->lilv_instance),
+                                           widget_symbol, (ALABS_HMI_Widget)widget, &area);
+
+    return SUCCESS;
+#else
+    return ERR_HMI_UNAVAILABLE;
+
+    UNUSED_PARAM(effect_id);
+    UNUSED_PARAM(widget_symbol);
+    UNUSED_PARAM(area_id);
+    UNUSED_PARAM(width);
+    UNUSED_PARAM(height);
+    UNUSED_PARAM(format);
+#endif
+}
+
+int effects_hmi_widget_hide(int area_id)
+{
+#ifdef MOD_HMI_CONTROL_ENABLED
+    int resp = area_id == -1 ? SUCCESS : ERR_ASSIGNMENT_INVALID_OP;
+
+    for (int i = 0; i < MAX_HMI_WIDGETS; i++)
+    {
+        hmi_widget_t *widget = &g_hmi_widgets[i];
+
+        if (widget->area_id == -1 || (area_id != -1 && widget->area_id != area_id))
+            continue;
+
+        if (InstanceExist(widget->effect_id))
+        {
+            effect_t *effect = &(g_effects[widget->effect_id]);
+
+            if (effect->hmi_widget_notif != NULL)
+                effect->hmi_widget_notif->widget_hidden(lilv_instance_get_handle(effect->lilv_instance),
+                                                        (ALABS_HMI_Widget)widget);
+        }
+
+        widget->area_id = -1;
+        resp = SUCCESS;
+    }
+
+    return resp;
+#else
+    return ERR_HMI_UNAVAILABLE;
+
+    UNUSED_PARAM(area_id);
+#endif
+}
+
 float effects_jack_cpu_load(void)
 {
     return jack_cpu_load(g_jack_global_client);
@@ -9158,6 +9457,7 @@ int effects_state_load(const char *dir)
         &g_options_feature,
 #ifdef MOD_HMI_CONTROL_ENABLED
         &g_hmi_wc_feature,
+        &g_hmi_wd_feature,
 #endif
         &g_license_feature,
         &g_buf_size_features[0],
@@ -9253,6 +9553,7 @@ int effects_state_save(const char *dir)
         &g_options_feature,
 #ifdef MOD_HMI_CONTROL_ENABLED
         &g_hmi_wc_feature,
+        &g_hmi_wd_feature,
 #endif
         &g_license_feature,
         &g_buf_size_features[0],
@@ -9457,6 +9758,10 @@ int effects_aggregated_midi_enable(int enable)
 
         // step 2. connect to all midi hw ports
         ConnectToAllHardwareMIDIPorts();
+
+        // step 3. connect feedback if needed
+        if(g_enable_midi_feedback)
+            effects_midi_feedback_connect_hw_ports();
     }
 #endif // HAVE_JACK2
 
@@ -9531,70 +9836,226 @@ int effects_processing_enable(int enable)
     return SUCCESS;
 }
 
+void effects_midi_feedback_connect_hw_ports(void)
+{
+    const char** const midihwports = jack_get_ports(g_jack_global_client, "",
+                                                    JACK_DEFAULT_MIDI_TYPE,
+                                                    JackPortIsTerminal|JackPortIsPhysical|JackPortIsInput);
+    if (midihwports != NULL)
+    {
+        const char *ourportname = jack_port_name(g_midi_out_port);
+
+        char  aliases[2][320];
+        char* aliasesptr[2] = {
+            aliases[0],
+            aliases[1]
+        };
+
+        for (int i=0; midihwports[i] != NULL; ++i)
+        {
+            jack_port_t* const port = jack_port_by_name(g_jack_global_client, midihwports[i]);
+
+            if (port == NULL)
+                continue;
+
+            if (jack_port_get_aliases(port, aliasesptr) > 0)
+            {
+                if (strncmp(aliases[0], "alsa_pcm:Midi-Through/", 22) == 0)
+                    continue;
+            }
+
+            jack_connect(g_jack_global_client, ourportname, midihwports[i]);
+        }
+
+        jack_free(midihwports);
+    }
+
+}
+
+int effects_midi_feedback_enable(int enable) 
+{
+    bool newSetting = enable != 0;
+    int result = SUCCESS;
+
+    if(newSetting != g_enable_midi_feedback)
+    {
+        g_enable_midi_feedback = enable != 0;
+        
+        if(g_enable_midi_feedback) 
+        {
+            // turn on
+            g_midi_out_port = jack_port_register(g_jack_global_client, "midi_out", JACK_DEFAULT_MIDI_TYPE, JackPortIsOutput, 0); 
+
+            if (! g_midi_out_port)
+            {
+                fprintf(stderr, "can't register global jack midi-out port\n");
+                g_enable_midi_feedback = false;
+
+                result = ERR_JACK_PORT_REGISTER;
+            }
+            else
+            {
+                if(g_aggregated_midi_enabled)
+                {
+                    const char *ourportnameout = jack_port_name(g_midi_out_port);
+                    jack_connect(g_jack_global_client, ourportnameout, "mod-midi-broadcaster:in");
+                }
+                else
+                {
+                    effects_midi_feedback_connect_hw_ports();
+                }
+            }
+        }
+        else
+        {
+            // turn off
+            jack_port_unregister(g_jack_global_client, g_midi_out_port);
+            g_midi_out_port = NULL;
+        }
+    }
+    return result;
+}
+
+int effects_midi_feedback_sync_enable(int enable) 
+{
+    g_enable_midi_feedback_sync = enable != 0;
+    return SUCCESS;
+}
+
+int effects_midi_nrpn_enable(int enable) 
+{
+    g_enable_nrpn = enable != 0;
+    return SUCCESS;
+}
+
 int effects_monitor_audio_levels(const char *source_port_name, int enable)
 {
-    if (g_jack_global_client == NULL)
+    if (g_jack_global_client == NULL || source_port_name == NULL || source_port_name[0] == '\0')
         return ERR_INVALID_OPERATION;
 
     if (enable)
     {
-        for (int i = 0; i < g_audio_monitor_count; ++i)
-        {
-            if (!strcmp(g_audio_monitors[i].source_port_name, source_port_name))
-                return SUCCESS;
-        }
+        int port_id = -1;
 
         pthread_mutex_lock(&g_audio_monitor_mutex);
-        g_audio_monitors = realloc(g_audio_monitors, sizeof(audio_monitor_t) * (g_audio_monitor_count + 1));
+        for (int i = 0; i < g_audio_monitor_count; ++i)
+        {
+            if (g_audio_monitors[i].source_port_name &&
+                strcmp(g_audio_monitors[i].source_port_name, source_port_name) == 0)
+            {
+                pthread_mutex_unlock(&g_audio_monitor_mutex);
+                return SUCCESS;
+            }
+        }
+
+        // assign new port id
+        port_id = ++g_audio_monitor_port_id;
         pthread_mutex_unlock(&g_audio_monitor_mutex);
 
-        if (g_audio_monitors == NULL)
-            return ERR_MEMORY_ALLOCATION;
-
-        audio_monitor_t *monitor = &g_audio_monitors[g_audio_monitor_count];
-
+        // setup new jack monitor port
         char port_name[0xff];
-        snprintf(port_name, sizeof(port_name) - 1, "monitor_%d", g_audio_monitor_count + 1);
+        snprintf(port_name, sizeof(port_name) - 1, "monitor_%d", port_id);
 
         jack_port_t *port = jack_port_register(g_jack_global_client,
                                                port_name,
                                                JACK_DEFAULT_AUDIO_TYPE,
                                                JackPortIsInput,
                                                0);
+
         if (port == NULL)
             return ERR_JACK_PORT_REGISTER;
 
         snprintf(port_name, sizeof(port_name) - 1, "%s:monitor_%d",
-                 jack_get_client_name(g_jack_global_client), g_audio_monitor_count + 1);
-        jack_connect(g_jack_global_client, source_port_name, port_name);
+                 jack_get_client_name(g_jack_global_client), port_id);
 
+        if (jack_connect(g_jack_global_client, source_port_name, port_name) != 0)
+        {
+            jack_port_unregister(g_jack_global_client, port);
+            return ERR_JACK_PORT_REGISTER;
+        }
+
+        // commit the new monitor port to the list of active monitors
+        pthread_mutex_lock(&g_audio_monitor_mutex);
+        audio_monitor_t *tmp = realloc(g_audio_monitors,
+                                      sizeof(audio_monitor_t) * (g_audio_monitor_count + 1));
+        if (tmp == NULL)
+        {
+            pthread_mutex_unlock(&g_audio_monitor_mutex);
+            jack_port_unregister(g_jack_global_client, port);
+            return ERR_MEMORY_ALLOCATION;
+        }
+
+        g_audio_monitors = tmp;
+
+        audio_monitor_t *monitor = &g_audio_monitors[g_audio_monitor_count];
         monitor->port = port;
         monitor->source_port_name = strdup(source_port_name);
         monitor->value = 0.f;
 
         ++g_audio_monitor_count;
+        pthread_mutex_unlock(&g_audio_monitor_mutex);
     }
     else
     {
-        if (g_audio_monitor_count == 0)
-            return ERR_INVALID_OPERATION;
-
-        audio_monitor_t *monitor = &g_audio_monitors[g_audio_monitor_count - 1];
-
-        if (strcmp(monitor->source_port_name, source_port_name))
-            return ERR_INVALID_OPERATION;
-
         pthread_mutex_lock(&g_audio_monitor_mutex);
-        --g_audio_monitor_count;
-        pthread_mutex_unlock(&g_audio_monitor_mutex);
+        int idx = -1;
+        for (int i = 0; i < g_audio_monitor_count; ++i)
+        {
+            if (!strcmp(g_audio_monitors[i].source_port_name, source_port_name))
+            {
+                idx = i;
+                break;
+            }
+        }
 
-        jack_port_unregister(g_jack_global_client, monitor->port);
-        free(monitor->source_port_name);
+        if (idx < 0)
+        {
+            pthread_mutex_unlock(&g_audio_monitor_mutex);
+            return ERR_INVALID_OPERATION;
+        }
+
+        jack_port_t *port = g_audio_monitors[idx].port;
+        char *source_name = g_audio_monitors[idx].source_port_name;
+
+        for (int i = idx; i + 1 < g_audio_monitor_count; ++i)
+        {
+            g_audio_monitors[i] = g_audio_monitors[i + 1];
+        }
+        --g_audio_monitor_count;
 
         if (g_audio_monitor_count == 0)
         {
             free(g_audio_monitors);
             g_audio_monitors = NULL;
+        }
+        pthread_mutex_unlock(&g_audio_monitor_mutex);
+
+        // this can be slow, so we do it outside the mutex lock
+        jack_port_unregister(g_jack_global_client, port);
+        free(source_name);
+    }
+
+    return SUCCESS;
+}
+
+int effects_monitor_cpu_load(int enable, int num_effects, int *effects)
+{
+    if (num_effects <= 0)
+        return ERR_INVALID_OPERATION;
+
+    effect_t *effect;
+
+    for (int i = 0, effect_id; i < num_effects; i++)
+    {
+        effect_id = effects[i];
+        if (InstanceExist(effect_id))
+        {
+            effect = &g_effects[effect_id];
+
+            if (enable != 0)
+                atomic_store(&effect->monitor_cpu_reset, true);
+
+            atomic_store(&effect->monitor_cpu, enable != 0);
         }
     }
 
@@ -9765,6 +10226,20 @@ void effects_output_data_ready(void)
 
     if (! g_postevents_ready)
     {
+        // recalculate max cpu usage again
+        for (int i = 0; i < MAX_PLUGIN_INSTANCES; ++i)
+        {
+            effect_t *effect = &g_effects[i];
+
+            if (effect->lilv_instance == NULL)
+                continue;
+            if (effect->lilv_plugin == NULL)
+                continue;
+
+            if (atomic_load(&effect->monitor_cpu))
+                atomic_store(&effect->monitor_cpu_reset, true);
+        }
+
         g_postevents_ready = true;
         sem_post(&g_postevents_semaphore);
     }
