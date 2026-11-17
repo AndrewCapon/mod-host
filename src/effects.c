@@ -1110,7 +1110,7 @@ static void         insert_midi_cc(midi_cc_t *mcc);
 static void         midi_feedback_add(midi_cc_t *mcc);
 static void         clear_midi_cc_needs_sending(void);
 static void         remove_midi_cc(midi_cc_t *mcc);
-static midi_cc_t    *get_midi_cc(int8_t channel, uint16_t controller, midi_cc_t *current);
+static midi_cc_t    *get_midi_cc(int8_t channel, uint16_t controller, bool is_cc, midi_cc_t *current);
 static uint32_t     midi_cc_hash_key(int effect_id, const char* symbol);
 static void         midi_cc_hash_init(void);
 static void         midi_cc_hash_insert(int effect_id, const char* symbol, midi_cc_t *mcc);
@@ -3341,7 +3341,8 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
 
         possible_14_bit_msb = false;
         possible_14_bit_lsb = false;
-        [[maybe_unused]] bool is_cc = false;
+        bool is_cc = false;
+        bool is_cc_14_bit_lsb = false;
 
         // Handle MIDI Beat Clock
         if (g_transport_sync_mode == TRANSPORT_SYNC_MIDI)
@@ -3498,6 +3499,8 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
             mvalue     = event.buffer[2];
             highres    = false;
             is_cc      = true;
+            is_cc_14_bit_lsb = false;
+
             if(controller < 32)
             {
                 controller_14_msb = EncodedControllerForController(controller, MIDI_TYPE_CC_14);
@@ -3507,6 +3510,7 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
             {
                 controller_14_msb = EncodedControllerForController(controller-32, MIDI_TYPE_CC_14);
                 possible_14_bit_lsb = true;
+                is_cc_14_bit_lsb = true;
             }
             else
             {
@@ -3653,7 +3657,13 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
         channel = (event.buffer[0] & 0x0F);
 
 #if USE_ALTERNATIVE_MIDI_STORAGE            
-        midi_cc_t *mcc = get_midi_cc(channel, controller, NULL);
+        midi_cc_t *mcc = get_midi_cc(channel, controller, is_cc, NULL);
+        if (is_cc_14_bit_lsb && mcc == NULL )
+        {
+            // need to check via msb incase we are 14 bit
+            is_cc_14_bit_lsb = false;
+            mcc = get_midi_cc(channel, controller_14_msb, is_cc, NULL);
+        }
 #else
         uint16_t start_index = 0;
         midi_cc_t *mcc = get_midi_cc(channel, controller, is_cc, &start_index);
@@ -3736,14 +3746,23 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
             // get next one if using macros
             if(g_enable_midi_macros)
 #if USE_ALTERNATIVE_MIDI_STORAGE            
-                mcc = get_midi_cc(channel, controller, mcc);
+                mcc = get_midi_cc(channel, controller, is_cc, mcc);
 #else
                 mcc = get_midi_cc(channel, controller, is_cc, &start_index);
 #endif                
             else
                 mcc = NULL;
-        }
 
+#if USE_ALTERNATIVE_MIDI_STORAGE            
+            if (is_cc_14_bit_lsb && mcc == NULL )
+            {
+                // need to check via msb incase we are 14 bit
+                is_cc_14_bit_lsb = false;
+                mcc = get_midi_cc(channel, controller_14_msb, is_cc, NULL);
+            }
+#endif
+        }
+        
         if (!handled || g_enable_midi_macros)
         {
             int effect_id;
@@ -10652,9 +10671,18 @@ midi_cc_t *add_midi_cc(int8_t channel, uint16_t controller,
     return added;
 }
 
-midi_cc_t *get_midi_cc(int8_t channel, uint16_t controller, midi_cc_t *current)
+midi_cc_t *get_midi_cc(int8_t channel, uint16_t controller, bool is_cc, midi_cc_t *current)
 {
     midi_cc_t *result = NULL;
+
+    uint16_t cc_14_bit_controller = controller;
+    if(is_cc)
+    {
+        if(controller < 32)
+            cc_14_bit_controller = EncodedControllerForController(controller, MIDI_TYPE_CC_14);
+        else if (controller >= 32 && controller < 64)
+            cc_14_bit_controller = EncodedControllerForController(controller-32, MIDI_TYPE_CC_14);
+    }
 
     uint8_t idx = controller & 0x7f;   
     if(!current)
@@ -10664,7 +10692,12 @@ midi_cc_t *get_midi_cc(int8_t channel, uint16_t controller, midi_cc_t *current)
 
     while(result != NULL)
     {
-        if(result->channel == channel && result->controller == controller)
+        bool found = (result->channel == channel && result->controller == controller);
+
+        if(!found && (cc_14_bit_controller != controller))
+            found  = (result->channel == channel && result->controller == cc_14_bit_controller);
+
+        if (found)
         {
             result = result;
             break;
