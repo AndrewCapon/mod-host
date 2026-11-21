@@ -64,7 +64,9 @@ typedef unsigned int uint;
 #include <unistd.h>
 #endif
 
+#if !_DARKGLASS_PABLITO
 #define USE_ALTERNATIVE_MIDI_STORAGE 1
+#endif 
 
 /* Jack */
 #include <jack/jack.h>
