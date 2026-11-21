@@ -2926,13 +2926,8 @@ static bool SetPortValue(port_t *port, float value, int effect_id, bool is_bypas
     if(g_enable_multiple_controllers)
     { 
         if(update_midi) {
-            if (g_verbose_debug)
-                printf("DEBUG: SetPortValue() sending midi\n");
-                
             effects_send_midi_feedback(effect_id, (const char *)port->symbol);
         }
-        else if (g_verbose_debug) 
-            printf("DEBUG: SetPortValue() not sending midi\n");
     }
 
     if (update_transport)
